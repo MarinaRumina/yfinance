@@ -1,7 +1,26 @@
 from fastapi import FastAPI, Query
 import yfinance as yf
+import pandas as pd
 
 app = FastAPI()
+
+def safe_to_dict(obj):
+    if isinstance(obj, (pd.DataFrame, pd.Series)):
+        if not obj.empty:
+            # Если DataFrame, приводим к списку dict'ов
+            # Для Series — просто к dict'у
+            if isinstance(obj, pd.DataFrame):
+                return obj.reset_index().to_dict(orient="records")
+            else:
+                return obj.to_dict()
+        else:
+            return []
+    elif isinstance(obj, dict):
+        return obj
+    elif obj is None:
+        return {}
+    else:
+        return str(obj)
 
 # Single data endpoints
 @app.get("/quote")
@@ -9,7 +28,7 @@ def quote(ticker: str = Query(...)):
     try:
         t = yf.Ticker(ticker)
         data = t.history(period="1d")
-        return data.reset_index().to_dict(orient="records")
+        return safe_to_dict(data)
     except Exception as e:
         return {"error": str(e)}
 
@@ -17,7 +36,7 @@ def quote(ticker: str = Query(...)):
 def info(ticker: str = Query(...)):
     try:
         t = yf.Ticker(ticker)
-        return t.info
+        return safe_to_dict(t.info)
     except Exception as e:
         return {"error": str(e)}
 
@@ -25,7 +44,7 @@ def info(ticker: str = Query(...)):
 def dividends(ticker: str = Query(...)):
     try:
         t = yf.Ticker(ticker)
-        return t.dividends.to_dict()
+        return safe_to_dict(t.dividends)
     except Exception as e:
         return {"error": str(e)}
 
@@ -33,7 +52,7 @@ def dividends(ticker: str = Query(...)):
 def actions(ticker: str = Query(...)):
     try:
         t = yf.Ticker(ticker)
-        return t.actions.to_dict()
+        return safe_to_dict(t.actions)
     except Exception as e:
         return {"error": str(e)}
 
@@ -41,7 +60,7 @@ def actions(ticker: str = Query(...)):
 def splits(ticker: str = Query(...)):
     try:
         t = yf.Ticker(ticker)
-        return t.splits.to_dict()
+        return safe_to_dict(t.splits)
     except Exception as e:
         return {"error": str(e)}
 
@@ -49,7 +68,7 @@ def splits(ticker: str = Query(...)):
 def financials(ticker: str = Query(...)):
     try:
         t = yf.Ticker(ticker)
-        return t.financials.to_dict()
+        return safe_to_dict(t.financials)
     except Exception as e:
         return {"error": str(e)}
 
@@ -57,7 +76,7 @@ def financials(ticker: str = Query(...)):
 def balance_sheet(ticker: str = Query(...)):
     try:
         t = yf.Ticker(ticker)
-        return t.balance_sheet.to_dict()
+        return safe_to_dict(t.balance_sheet)
     except Exception as e:
         return {"error": str(e)}
 
@@ -65,7 +84,7 @@ def balance_sheet(ticker: str = Query(...)):
 def cashflow(ticker: str = Query(...)):
     try:
         t = yf.Ticker(ticker)
-        return t.cashflow.to_dict()
+        return safe_to_dict(t.cashflow)
     except Exception as e:
         return {"error": str(e)}
 
@@ -73,7 +92,7 @@ def cashflow(ticker: str = Query(...)):
 def calendar(ticker: str = Query(...)):
     try:
         t = yf.Ticker(ticker)
-        return t.calendar.to_dict()
+        return safe_to_dict(t.calendar)
     except Exception as e:
         return {"error": str(e)}
 
@@ -85,7 +104,7 @@ def history(
 ):
     try:
         data = yf.download(ticker, period=period, interval=interval)
-        return data.reset_index().to_dict(orient="records")
+        return safe_to_dict(data)
     except Exception as e:
         return {"error": str(e)}
 
@@ -93,7 +112,10 @@ def history(
 @app.get("/tickers")
 def tickers(symbols: str = Query(...)):
     try:
-        return yf.Tickers(symbols).tickers
+        tickers_obj = yf.Tickers(symbols)
+        # Возвращаем список тикеров и их info
+        result = {sym: safe_to_dict(t.info) for sym, t in tickers_obj.tickers.items()}
+        return result
     except Exception as e:
         return {"error": str(e)}
 
@@ -102,20 +124,20 @@ def ticker(ticker: str = Query(...)):
     try:
         t = yf.Ticker(ticker)
         return {
-            "info": t.info,
-            "history": t.history(period="1y").reset_index().to_dict(orient="records"),
-            "actions": t.actions.to_dict(),
-            "dividends": t.dividends.to_dict(),
-            "splits": t.splits.to_dict(),
-            "financials": t.financials.to_dict(),
-            "balance_sheet": t.balance_sheet.to_dict(),
-            "cashflow": t.cashflow.to_dict(),
-            "calendar": t.calendar.to_dict(),
-            "earnings": t.earnings.to_dict(),
-            "sustainability": getattr(t, "sustainability", None),
+            "info": safe_to_dict(t.info),
+            "history": safe_to_dict(t.history(period="1y")),
+            "actions": safe_to_dict(t.actions),
+            "dividends": safe_to_dict(t.dividends),
+            "splits": safe_to_dict(t.splits),
+            "financials": safe_to_dict(t.financials),
+            "balance_sheet": safe_to_dict(t.balance_sheet),
+            "cashflow": safe_to_dict(t.cashflow),
+            "calendar": safe_to_dict(t.calendar),
+            "earnings": safe_to_dict(getattr(t, "earnings", {})),
+            "sustainability": safe_to_dict(getattr(t, "sustainability", {})),
             "isin": getattr(t, "isin", None),
-            "major_holders": t.major_holders.to_dict(),
-            "institutional_holders": t.institutional_holders.to_dict()
+            "major_holders": safe_to_dict(getattr(t, "major_holders", {})),
+            "institutional_holders": safe_to_dict(getattr(t, "institutional_holders", {}))
         }
     except Exception as e:
         return {"error": str(e)}
@@ -127,8 +149,8 @@ def download(
     interval: str = Query("1d")
 ):
     try:
-        data = yf.download(tickers, period=period, interval=interval)
-        return data.reset_index().to_dict(orient="records")
+        data = yf.download(tickers, period=period, interval=interval, group_by=None)
+        return safe_to_dict(data)
     except Exception as e:
         return {"error": str(e)}
 
@@ -197,7 +219,6 @@ def screener(query: str = Query(...)):
 def news(ticker: str = Query(...)):
     try:
         t = yf.Ticker(ticker)
-        return t.news
+        return safe_to_dict(getattr(t, "news", {}))
     except Exception as e:
         return {"error": str(e)}
-    return {"error": "News API not found"}
