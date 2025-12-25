@@ -113,15 +113,28 @@ def get_history(ticker: str, period: str = "1mo", interval: str = "1d"):
         raise HTTPException(status_code=404, detail="No history found")
     return normalize_value(hist)
 
-@app.get("/financials/{ticker}")
+@app.get("/financials/{ticker}", tags=["Data"])
 def get_financials(ticker: str):
-    t = yf.Ticker(ticker)
-    data = {
-        "income_statement": t.income_stmt,
-        "balance_sheet": t.balance_sheet,
-        "cashflow": t.cashflow
-    }
-    return normalize_value(data)
+    try:
+        t = yf.Ticker(ticker)
+        
+        # Получаем данные и сразу конвертируем в словари, если они не пустые
+        income = t.income_stmt
+        balance = t.balance_sheet
+        cash = t.cashflow
+        
+        data = {
+            "income_statement": income.to_dict() if not income.empty else {},
+            "balance_sheet": balance.to_dict() if not balance.empty else {},
+            "cashflow": cash.to_dict() if not cash.empty else {}
+        }
+        
+        # Прогоняем через вашу функцию очистки для безопасности
+        return normalize_value(data)
+    except Exception as e:
+        logger.error(f"Financials error for {ticker}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching financials: {str(e)}")
+        
 
 @app.get("/holders/{ticker}")
 def get_holders(ticker: str):
