@@ -138,63 +138,96 @@ def get_financials(ticker: str):
 # --- 1. Данные по нескольким тикерам сразу ---
 @app.get("/tickers/quote", tags=["Bulk Data"])
 def get_multiple_quotes(symbols: str = Query(..., description="Тикеры через запятую, напр. AAPL,MSFT,GOOG")):
-    """Получение базовых котировок для списка тикеров"""
+    """Получение котировок для списка тикеров с резервным механизмом получения цены"""
     try:
         ticker_list = [s.strip().upper() for s in symbols.split(",")]
+        # Используем yf.Tickers для загрузки данных пачкой
         tickers = yf.Tickers(" ".join(ticker_list))
         
         result = {}
         for symbol in ticker_list:
             t = tickers.tickers[symbol]
-            # Используем fast_info для скорости, если данных мало
+            
+            # Способ 1: Пробуем fast_info
+            price = t.fast_info.get('last_price')
+            
+            # Способ 2: Если цена null, пробуем взять последнее закрытие из истории
+            if price is None or np.isnan(price):
+                hist = t.history(period="1d")
+                if not hist.empty:
+                    price = hist['Close'].iloc[-1]
+            
             result[symbol] = {
-                "price": t.fast_info.get('last_price'),
+                "price": normalize_value(price),
                 "currency": t.fast_info.get('currency'),
-                "exchange": t.fast_info.get('exchange')
+                "exchange": t.fast_info.get('exchange'),
+                "timestamp": datetime.now().isoformat()
             }
-        return normalize_value(result)
+        return result
     except Exception as e:
         logger.error(f"Bulk quote error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# --- 2. Дивиденды (подробно) ---
+# --- 1. Дивиденды (с проверкой на наличие) ---
 @app.get("/dividends/{ticker}", tags=["Corporate Actions"])
-def get_detailed_dividends(ticker: str):
-    """История выплат дивидендов"""
+def get_dividends(ticker: str):
+    """История выплат дивидендов с уведомлением об отсутствии данных"""
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(ticker.upper())
         divs = t.dividends
-        if divs.empty:
-            return {"message": "No dividends found", "ticker": ticker.upper()}
+        
+        if divs is None or divs.empty:
+            return {
+                "symbol": ticker.upper(),
+                "message": f"No dividend data found for {ticker.upper()}",
+                "data": []
+            }
+            
         return normalize_value(divs)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Dividends error for {ticker}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
-# --- 3. Сплиты (дробление акций) ---
+# --- 2. Сплиты (с проверкой на наличие) ---
 @app.get("/splits/{ticker}", tags=["Corporate Actions"])
 def get_splits(ticker: str):
-    """История сплитов акций"""
+    """История сплитов акций с уведомлением об отсутствии данных"""
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(ticker.upper())
         splits = t.splits
-        if splits.empty:
-            return {"message": "No splits found", "ticker": ticker.upper()}
+        
+        if splits is None or splits.empty:
+            return {
+                "symbol": ticker.upper(),
+                "message": f"No split data found for {ticker.upper()}",
+                "data": []
+            }
+            
         return normalize_value(splits)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Splits error for {ticker}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
-# --- 4. Все действия (дивиденды + сплиты одним списком) ---
+# --- 3. Все действия (дивиденды + сплиты одним списком) ---
 @app.get("/actions/{ticker}", tags=["Corporate Actions"])
 def get_actions(ticker: str):
     """Все корпоративные действия (дивиденды и сплиты вместе)"""
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(ticker.upper())
         actions = t.actions
-        if actions.empty:
-            return {"message": "No actions found", "ticker": ticker.upper()}
+        
+        if actions is None or actions.empty:
+            return {
+                "symbol": ticker.upper(),
+                "message": f"No corporate actions (dividends/splits) found for {ticker.upper()}",
+                "data": []
+            }
+            
         return normalize_value(actions)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Actions error for {ticker}: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+
 
 # ---------------------------
 @app.get("/holders/{ticker}")
