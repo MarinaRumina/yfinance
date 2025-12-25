@@ -135,7 +135,68 @@ def get_financials(ticker: str):
         logger.error(f"Financials error for {ticker}: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching financials: {str(e)}")
         
+# --- 1. Данные по нескольким тикерам сразу ---
+@app.get("/tickers/quote", tags=["Bulk Data"])
+def get_multiple_quotes(symbols: str = Query(..., description="Тикеры через запятую, напр. AAPL,MSFT,GOOG")):
+    """Получение базовых котировок для списка тикеров"""
+    try:
+        ticker_list = [s.strip().upper() for s in symbols.split(",")]
+        tickers = yf.Tickers(" ".join(ticker_list))
+        
+        result = {}
+        for symbol in ticker_list:
+            t = tickers.tickers[symbol]
+            # Используем fast_info для скорости, если данных мало
+            result[symbol] = {
+                "price": t.fast_info.get('last_price'),
+                "currency": t.fast_info.get('currency'),
+                "exchange": t.fast_info.get('exchange')
+            }
+        return normalize_value(result)
+    except Exception as e:
+        logger.error(f"Bulk quote error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
+# --- 2. Дивиденды (подробно) ---
+@app.get("/dividends/{ticker}", tags=["Corporate Actions"])
+def get_detailed_dividends(ticker: str):
+    """История выплат дивидендов"""
+    try:
+        t = yf.Ticker(ticker)
+        divs = t.dividends
+        if divs.empty:
+            return {"message": "No dividends found", "ticker": ticker.upper()}
+        return normalize_value(divs)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- 3. Сплиты (дробление акций) ---
+@app.get("/splits/{ticker}", tags=["Corporate Actions"])
+def get_splits(ticker: str):
+    """История сплитов акций"""
+    try:
+        t = yf.Ticker(ticker)
+        splits = t.splits
+        if splits.empty:
+            return {"message": "No splits found", "ticker": ticker.upper()}
+        return normalize_value(splits)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- 4. Все действия (дивиденды + сплиты одним списком) ---
+@app.get("/actions/{ticker}", tags=["Corporate Actions"])
+def get_actions(ticker: str):
+    """Все корпоративные действия (дивиденды и сплиты вместе)"""
+    try:
+        t = yf.Ticker(ticker)
+        actions = t.actions
+        if actions.empty:
+            return {"message": "No actions found", "ticker": ticker.upper()}
+        return normalize_value(actions)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------
 @app.get("/holders/{ticker}")
 def get_holders(ticker: str):
     t = yf.Ticker(ticker)
@@ -162,6 +223,7 @@ def get_calendar(ticker: str):
 @app.get("/health")
 def health():
     return {"status": "online", "timestamp": datetime.now().isoformat()}
+    
 
 if __name__ == "__main__":
     import uvicorn
