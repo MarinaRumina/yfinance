@@ -137,36 +137,66 @@ def get_financials(ticker: str):
         
 # --- 1. Данные по нескольким тикерам сразу ---
 @app.get("/tickers/quote", tags=["Bulk Data"])
-def get_multiple_quotes(symbols: str = Query(..., description="Тикеры через запятую, напр. AAPL,MSFT,GOOG")):
-    """Получение котировок для списка тикеров с резервным механизмом получения цены"""
+def get_multiple_quotes(symbols: str = Query(..., description="Тикеры через запятую, напр. AAPL,MSFT,BTC-USD")):
+    """
+    Получение расширенных котировок: 
+    Current Price, Previous Close, Open, High, Low, Volume и % Change.
+    """
     try:
         ticker_list = [s.strip().upper() for s in symbols.split(",")]
-        # Используем yf.Tickers для загрузки данных пачкой
         tickers = yf.Tickers(" ".join(ticker_list))
         
         result = {}
         for symbol in ticker_list:
             t = tickers.tickers[symbol]
             
-            # Способ 1: Пробуем fast_info
-            price = t.fast_info.get('last_price')
+            # Извлекаем данные из fast_info
+            fast = t.fast_info
             
-            # Способ 2: Если цена null, пробуем взять последнее закрытие из истории
-            if price is None or np.isnan(price):
-                hist = t.history(period="1d")
-                if not hist.empty:
-                    price = hist['Close'].iloc[-1]
+            current_price = fast.get('last_price')
+            prev_close = fast.get('previous_close')
             
+            # Если в fast_info пусто, берем из истории последнего дня
+            if current_price is None or prev_close is None:
+                hist = t.history(period="2d") # Берем 2 дня, чтобы был доступ к закрытию вчера
+                if len(hist) >= 1:
+                    current_price = hist['Close'].iloc[-1]
+                    prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else fast.get('previous_close')
+                    open_p = hist['Open'].iloc[-1]
+                    high_p = hist['High'].iloc[-1]
+                    low_p = hist['Low'].iloc[-1]
+                    volume = hist['Volume'].iloc[-1]
+                else:
+                    current_price, prev_close, open_p, high_p, low_p, volume = [None]*6
+            else:
+                open_p = fast.get('open')
+                high_p = fast.get('day_high')
+                low_p = fast.get('day_low')
+                volume = fast.get('last_volume')
+
+            # Рассчитываем процент изменения
+            change_percent = 0.0
+            if current_price and prev_close:
+                change_percent = ((current_price - prev_close) / prev_close) * 100
+
             result[symbol] = {
-                "price": normalize_value(price),
-                "currency": t.fast_info.get('currency'),
-                "exchange": t.fast_info.get('exchange'),
+                "current_price": normalize_value(current_price),
+                "previous_close": normalize_value(prev_close),
+                "open": normalize_value(open_p),
+                "high": normalize_value(high_p),
+                "low": normalize_value(low_p),
+                "volume": normalize_value(volume),
+                "change_percent": normalize_value(round(change_percent, 2)),
+                "currency": fast.get('currency'),
+                "exchange_code": fast.get('exchange'), # Тот самый NMS, NYQ и т.д.
                 "timestamp": datetime.now().isoformat()
             }
+            
         return result
     except Exception as e:
-        logger.error(f"Bulk quote error: {e}")
+        logger.error(f"Detailed bulk quote error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 # --- 1. Дивиденды (с проверкой на наличие) ---
 @app.get("/dividends/{ticker}", tags=["Corporate Actions"])
