@@ -17,4 +17,5 @@ websockets>=13.0
 
 fastapi
 uvicorn
-yfinance
+yfinance>=0.2.40
+pandas>=2.2.2
