@@ -1,8 +1,8 @@
-from fastapi import FastAPI, Query
+import asyncio
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 import yfinance as yf
 import pandas as pd
-import numpy as np
-from typing import Any
+from typing import Optional
 
 app = FastAPI(title="yfinance wrapper API")
 
@@ -163,23 +163,35 @@ def quote(ticker: str = Query(...)):
         return {"error": str(e)}
 
 
-@app.get("/info")
-def info(ticker: str = Query(...)):
-    try:
-        t = yf.Ticker(ticker)
-        return safe_to_dict_for_endpoint(t.info, "info")
-    except Exception as e:
-        return {"error": str(e)}
+#@app.get("/info")
+#def info(ticker: str = Query(...)):
+#    try:
+#        t = yf.Ticker(ticker)
+#        return safe_to_dict_for_endpoint(t.info, "info")
+#    except Exception as e:
+#        return {"error": str(e)}
 
+@app.get("/info/{ticker}", tags=["Data"])
+def get_info(ticker: str):
+    t = yf.Ticker(ticker)
+    info = t.info
+    if not info or len(info) < 2: # Yahoo иногда возвращает пустой словарь
+        raise HTTPException(status_code=404, detail="Ticker not found or no info available")
+    return info
 
-@app.get("/dividends")
-def dividends(ticker: str = Query(...)):
-    try:
-        t = yf.Ticker(ticker)
-        return safe_to_dict_for_endpoint(t.dividends, "dividends")
-    except Exception as e:
-        return {"error": str(e)}
+#@app.get("/dividends")
+#def dividends(ticker: str = Query(...)):
+#    try:
+#        t = yf.Ticker(ticker)
+#        return safe_to_dict_for_endpoint(t.dividends, "dividends")
+#    except Exception as e:
+#        return {"error": str(e)}
 
+@app.get("/dividends/{ticker}", tags=["Data"])
+def get_dividends(ticker: str):
+    t = yf.Ticker(ticker)
+    divs = t.dividends
+    return divs.to_dict()
 
 @app.get("/actions")
 def actions(ticker: str = Query(...)):
@@ -236,18 +248,27 @@ def calendar(ticker: str = Query(...)):
         return {"error": str(e)}
 
 
-@app.get("/history")
-def history(
-    ticker: str = Query(...),
-    period: str = Query("1mo"),
-    interval: str = Query("1d")
-):
-    try:
-        data = yf.download(ticker, period=period, interval=interval, group_by="ticker")
-        # if group_by returns multi-column for multiple tickers, safe conversion will handle it
-        return safe_to_dict_for_endpoint(data, "history")
-    except Exception as e:
-        return {"error": str(e)}
+#@app.get("/history")
+#def history(
+#    ticker: str = Query(...),
+#    period: str = Query("1mo"),
+#    interval: str = Query("1d")
+#):
+#    try:
+#        data = yf.download(ticker, period=period, interval=interval, group_by="ticker")
+#        # if group_by returns multi-column for multiple tickers, safe conversion will handle it
+#        return safe_to_dict_for_endpoint(data, "history")
+#    except Exception as e:
+#        return {"error": str(e)}
+        
+@app.get("/history/{ticker}", tags=["Data"])
+def get_history(ticker: str, period: str = "1mo", interval: str = "1d"):
+    t = yf.Ticker(ticker)
+    df = t.history(period=period, interval=interval)
+    if df.empty:
+        raise HTTPException(status_code=404, detail="No history found")
+    # Преобразование индекса даты в строку для JSON
+    return df.reset_index().to_dict(orient="records")
 
 
 @app.get("/tickers")
@@ -309,17 +330,15 @@ def market(region: str = Query("US")):
     return {"error": "Market endpoint is not supported in this yfinance build. Use search/info endpoints instead."}
 
 
-@app.get("/search")
-def search(query: str = Query(...)):
-    # yfinance may not have Search helper in all versions; try a best-effort approach
+# --- 1. Поиск (НОВОЕ) ---
+@app.get("/search", tags=["Utility"])
+def search_ticker(query: str = Query(..., description="Название компании или тикер (напр. Apple)")):
+    """Поиск тикеров и информации о компаниях по ключевому слову"""
     try:
-        Search = getattr(yf, "Search", None)
-        if Search:
-            return safe_to_dict_for_endpoint(Search(query), "search")
-        # fallback: use yf.utils or other scraping? we return informative message
-        return {"error": "Search API not available in this yfinance version"}
+        s = yf.Search(query, max_results=10)
+        return {"results": s.quotes}
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/news")
@@ -329,3 +348,34 @@ def news(ticker: str = Query(...)):
         return safe_to_dict_for_endpoint(getattr(t, "news", {}), "news")
     except Exception as e:
         return {"error": str(e)}
+
+# --- 2. Живые цены через WebSocket (НОВОЕ) ---
+@app.websocket("/ws/price/{ticker}")
+async def websocket_endpoint(websocket: WebSocket, ticker: str):
+    await websocket.accept()
+    try:
+        # Пытаемся использовать новый модуль веб-сокетов yfinance
+        from yfinance import yf_websocket
+        async with yf_websocket.YfWebsocket() as yfw:
+            yfw.subscribe([ticker.upper()])
+            async for quote in yfw.messages():
+                await websocket.send_json({
+                    "symbol": ticker.upper(),
+                    "price": getattr(quote, 'price', 'N/A'),
+                    "time": str(getattr(quote, 'time', 'now'))
+                })
+    except (ImportError, Exception) as e:
+        # Если веб-сокеты не поддерживаются или ошибка, используем имитацию (Polling)
+        try:
+            while True:
+                t = yf.Ticker(ticker)
+                price = t.fast_info.get('last_price') or t.basic_info.get('last_price')
+                await websocket.send_json({"symbol": ticker.upper(), "price": price, "note": "Real-time via polling"})
+                await asyncio.sleep(2) # Пауза 2 секунды, чтобы не забанили
+        except WebSocketDisconnect:
+            pass
+
+# --- Вспомогательный эндпоинт для проверки работы ---
+@app.get("/", tags=["Utility"])
+def health_check():
+    return {"status": "active", "provider": "yfinance"}
