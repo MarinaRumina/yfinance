@@ -64,36 +64,40 @@ async def websocket_price(websocket: WebSocket, ticker: str):
     await websocket.accept()
     ticker_sym = ticker.upper()
     try:
-        # Пытаемся использовать официальный WebSocket yfinance
-        try:
-            from yfinance import yf_websocket
-            async with yf_websocket.YfWebsocket() as yfw:
-                yfw.subscribe([ticker_sym])
-                async for quote in yfw.messages():
-                    await websocket.send_json({
-                        "symbol": ticker_sym,
-                        "price": normalize_value(getattr(quote, 'price', None)),
-                        "time": datetime.now().isoformat(),
-                        "source": "yfinance_ws"
-                    })
-        except (ImportError, Exception):
-            # Резервный вариант: Polling (опрос раз в 2 секунды)
-            logger.info(f"Falling back to polling for {ticker_sym}")
-            t = yf.Ticker(ticker_sym)
-            while True:
-                price = t.fast_info.get('last_price')
-                await websocket.send_json({
-                    "symbol": ticker_sym, 
-                    "price": normalize_value(price),
-                    "time": datetime.now().isoformat(),
-                    "source": "polling"
-                })
-                await asyncio.sleep(2)
+        t = yf.Ticker(ticker_sym)
+        # Получаем базовые данные один раз для расчета
+        prev_close = t.fast_info.get('previous_close')
+        exchange_name = t.info.get('exchDisp', t.fast_info.get('exchange')) # Берем красивое имя
+
+        while True:
+            fast = t.fast_info
+            current_price = fast.get('last_price')
+            
+            # Рассчитываем процент изменения
+            change_percent = 0.0
+            if current_price and prev_close:
+                change_percent = ((current_price - prev_close) / prev_close) * 100
+
+            data = {
+                "symbol": ticker_sym,
+                "price": normalize_value(current_price),
+                "change_percent": normalize_value(round(change_percent, 2)),
+                "high": normalize_value(fast.get('day_high')),
+                "low": normalize_value(fast.get('day_low')),
+                "volume": normalize_value(fast.get('last_volume')),
+                "exchange": exchange_name,
+                "time": datetime.now().isoformat()
+            }
+            
+            await websocket.send_json(data)
+            await asyncio.sleep(2) # Пауза, чтобы не нагружать Yahoo
+            
     except WebSocketDisconnect:
         logger.info(f"Client disconnected from {ticker_sym}")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         await websocket.close()
+
 
 # --- ВАШИ ОРИГИНАЛЬНЫЕ ЭНДПОИНТЫ (УЛУЧШЕННЫЕ) ---
 
@@ -137,44 +141,26 @@ def get_financials(ticker: str):
         
 # --- 1. Данные по нескольким тикерам сразу ---
 @app.get("/tickers/quote", tags=["Bulk Data"])
-def get_multiple_quotes(symbols: str = Query(..., description="Тикеры через запятую, напр. AAPL,MSFT,BTC-USD")):
-    """
-    Получение расширенных котировок: 
-    Current Price, Previous Close, Open, High, Low, Volume и % Change.
-    """
+def get_multiple_quotes(symbols: str = Query(..., description="AAPL,MSFT,BTC-USD")):
     try:
         ticker_list = [s.strip().upper() for s in symbols.split(",")]
         tickers = yf.Tickers(" ".join(ticker_list))
-        
         result = {}
+
         for symbol in ticker_list:
             t = tickers.tickers[symbol]
-            
-            # Извлекаем данные из fast_info
             fast = t.fast_info
             
+            # Получаем расширенную информацию (может быть чуть медленнее из-за t.info)
+            try:
+                exchange_full = t.info.get('exchDisp', fast.get('exchange'))
+            except:
+                exchange_full = fast.get('exchange')
+
             current_price = fast.get('last_price')
             prev_close = fast.get('previous_close')
             
-            # Если в fast_info пусто, берем из истории последнего дня
-            if current_price is None or prev_close is None:
-                hist = t.history(period="2d") # Берем 2 дня, чтобы был доступ к закрытию вчера
-                if len(hist) >= 1:
-                    current_price = hist['Close'].iloc[-1]
-                    prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else fast.get('previous_close')
-                    open_p = hist['Open'].iloc[-1]
-                    high_p = hist['High'].iloc[-1]
-                    low_p = hist['Low'].iloc[-1]
-                    volume = hist['Volume'].iloc[-1]
-                else:
-                    current_price, prev_close, open_p, high_p, low_p, volume = [None]*6
-            else:
-                open_p = fast.get('open')
-                high_p = fast.get('day_high')
-                low_p = fast.get('day_low')
-                volume = fast.get('last_volume')
-
-            # Рассчитываем процент изменения
+            # Расчет процента
             change_percent = 0.0
             if current_price and prev_close:
                 change_percent = ((current_price - prev_close) / prev_close) * 100
@@ -182,19 +168,16 @@ def get_multiple_quotes(symbols: str = Query(..., description="Тикеры че
             result[symbol] = {
                 "current_price": normalize_value(current_price),
                 "previous_close": normalize_value(prev_close),
-                "open": normalize_value(open_p),
-                "high": normalize_value(high_p),
-                "low": normalize_value(low_p),
-                "volume": normalize_value(volume),
                 "change_percent": normalize_value(round(change_percent, 2)),
-                "currency": fast.get('currency'),
-                "exchange_code": fast.get('exchange'), # Тот самый NMS, NYQ и т.д.
-                "timestamp": datetime.now().isoformat()
+                "open": normalize_value(fast.get('open')),
+                "high": normalize_value(fast.get('day_high')),
+                "low": normalize_value(fast.get('day_low')),
+                "volume": normalize_value(fast.get('last_volume')),
+                "exchange": exchange_full,
+                "exchange_code": fast.get('exchange')
             }
-            
         return result
     except Exception as e:
-        logger.error(f"Detailed bulk quote error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
