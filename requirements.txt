@@ -15,7 +15,9 @@ curl_cffi>=0.7,<0.14
 protobuf>=3.19.0
 websockets>=13.0
 
-fastapi
-uvicorn
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
 yfinance>=0.2.40
 pandas>=2.2.2
+numpy>=1.26.4
+python-multipart
