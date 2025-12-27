@@ -1,7 +1,8 @@
 import asyncio
 import logging
+import os
 from typing import Optional, Any, List, Dict
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
@@ -14,8 +15,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="YFinance Pro API",
-    description="Полный API с поддержкой длительных праздников и WebSockets.",
-    version="1.3.0"
+    description="Финальная версия API с полной поддержкой истории, новостей и WebSockets.",
+    version="1.4.0"
 )
 
 app.add_middleware(
@@ -26,7 +27,7 @@ app.add_middleware(
 )
 
 def normalize_value(v: Any) -> Any:
-    """Преобразование типов данных для JSON-ответа."""
+    """Преобразование типов данных для JSON."""
     if isinstance(v, (pd.Timestamp, datetime)):
         return v.isoformat()
     if isinstance(v, (np.integer, int)):
@@ -37,6 +38,10 @@ def normalize_value(v: Any) -> Any:
         return v.reset_index().to_dict(orient="records")
     if isinstance(v, pd.Series):
         return v.to_dict()
+    if isinstance(v, dict):
+        return {str(k): normalize_value(val) for k, val in v.items()}
+    if isinstance(v, list):
+        return [normalize_value(i) for i in v]
     return v
 
 # --- УТИЛИТЫ ---
@@ -53,9 +58,10 @@ def search_ticker(query: str = Query(..., description="Название или �
 # --- РЫНОЧНЫЕ ДАННЫЕ ---
 
 @app.get("/tickers/quote", tags=["Market Data"])
-def get_multiple_quotes(symbols: str = Query(..., description="Тикеры через запятую: AAPL,MSFT")):
+def get_multiple_quotes(symbols: str = Query(..., description="Тикеры через запятую: AAPL,TSLA,LSEG.L")):
     """
-    Расширенная котировка. Поддерживает поиск цены, если торгов не было до 7 дней.
+    Получение расширенных котировок. 
+    Если рынок закрыт более недели, поиск расширяется до 30 дней.
     """
     try:
         ticker_list = [s.strip().upper() for s in symbols.split(",")]
@@ -66,40 +72,40 @@ def get_multiple_quotes(symbols: str = Query(..., description="Тикеры че
             t = tickers.tickers[symbol]
             fast = t.fast_info
             
-            # Пытаемся взять живую цену
-            current_price = fast.get('last_price')
-            prev_close = fast.get('previous_close')
+            curr = fast.get('last_price')
+            prev = fast.get('previous_close')
             
-            # Если пусто (праздники/выходные), берем историю за последние 7 дней
-            if current_price is None or prev_close is None or np.isnan(current_price):
-                hist = t.history(period="7d") 
+            # Если данных нет (долгие праздники), запрашиваем историю за месяц
+            if curr is None or prev is None or np.isnan(curr):
+                hist = t.history(period="1mo") 
                 if not hist.empty:
-                    current_price = hist['Close'].iloc[-1]
-                    prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else current_price
+                    curr = hist['Close'].iloc[-1]
+                    prev = hist['Close'].iloc[-2] if len(hist) > 1 else curr
                     open_p, high_p, low_p, vol = hist['Open'].iloc[-1], hist['High'].iloc[-1], hist['Low'].iloc[-1], hist['Volume'].iloc[-1]
                 else:
-                    current_price, prev_close, open_p, high_p, low_p, vol = [None]*6
+                    curr, prev, open_p, high_p, low_p, vol = [None]*6
             else:
                 open_p, high_p, low_p, vol = fast.get('open'), fast.get('day_high'), fast.get('day_low'), fast.get('last_volume')
 
-            change_pct = ((current_price - prev_close) / prev_close * 100) if current_price and prev_close else 0
+            change_pct = ((curr - prev) / prev * 100) if curr and prev else 0
 
             result[symbol] = {
-                "current_price": normalize_value(current_price),
+                "current_price": normalize_value(curr),
                 "change_percent": normalize_value(round(change_pct, 2)),
-                "previous_close": normalize_value(prev_close),
+                "previous_close": normalize_value(prev),
                 "open": normalize_value(open_p),
                 "high": normalize_value(high_p),
                 "low": normalize_value(low_p),
                 "volume": normalize_value(vol),
-                "exchange": t.info.get('exchDisp', fast.get('exchange')), # Понятное имя
-                "exchange_code": fast.get('exchange'),
-                "currency": fast.get('currency')
+                "exchange": t.info.get('exchDisp', fast.get('exchange')),
+                "currency": fast.get('currency'),
+                "timestamp": datetime.now().isoformat()
             }
         return result
     except Exception as e:
         logger.error(f"Quote error: {e}")
-        raise HTTPException(status_code=500, detail="Error fetching quotes")
+        raise HTTPException(status_code=500, detail="Ошибка получения котировок")
+
 
 @app.websocket("/ws/price/{ticker}")
 async def websocket_price(websocket: WebSocket, ticker: str):
@@ -200,46 +206,32 @@ def get_holders(ticker: str):
         "institutional": t.institutional_holders
     })
 
-# ---------------------------
+# --- ДОПОЛНИТЕЛЬНЫЕ ЭНДПОИНТЫ ---
+
 @app.get("/news/{ticker}", tags=["Information"])
 def get_news(ticker: str):
-    """Последние новости по компании."""
+    """Последние новости по тикеру."""
     t = yf.Ticker(ticker.upper())
-    news = t.news
-    return normalize_value(news) if news else {"message": "No news found"}
+    return normalize_value(t.news)
 
 @app.get("/recommendations/{ticker}", tags=["Information"])
 def get_recommendations(ticker: str):
-    """Рекомендации аналитиков (Buy/Hold/Sell)."""
-    try:
-        t = yf.Ticker(ticker.upper())
-        rec = t.recommendations
-        if rec is None or rec.empty:
-            return {"symbol": ticker.upper(), "message": "No recommendations found"}
-        return normalize_value(rec)
-    except Exception:
-        return {"symbol": ticker.upper(), "message": "Recommendations unavailable"}
+    """Рекомендации аналитиков."""
+    t = yf.Ticker(ticker.upper())
+    return normalize_value(t.recommendations)
 
 @app.get("/calendar/{ticker}", tags=["Information"])
 def get_calendar(ticker: str):
-    """Календарь предстоящих событий (отчеты, дивиденды)."""
-    try:
-        t = yf.Ticker(ticker.upper())
-        cal = t.calendar
-        if not cal:
-            return {"symbol": ticker.upper(), "message": "No calendar data found"}
-        return normalize_value(cal)
-    except Exception:
-        return {"symbol": ticker.upper(), "message": "Calendar unavailable"}
+    """Календарь событий (отчеты, дивиденды)."""
+    t = yf.Ticker(ticker.upper())
+    return normalize_value(t.calendar)
 
 @app.get("/health", tags=["Utility"])
 def health():
-    """Проверка статуса сервера."""
     return {"status": "online", "timestamp": datetime.now().isoformat()}
+
 
 if __name__ == "__main__":
     import uvicorn
-    # Порт лучше брать из переменной окружения для Render
-    import os
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
