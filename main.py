@@ -194,14 +194,16 @@ async def websocket_price(websocket: WebSocket, ticker: str):
 # --- ФИНАНСЫ И ОТЧЕТНОСТЬ ---
 @app.get("/financials/{ticker}", tags=["Financials"])
 def get_financials(ticker: str):
+    """Баланс, Прибыли и Кэшфлоу."""
     try:
         t = yf.Ticker(ticker.upper())
-        # Жесткая проверка на наличие данных
-        if t.income_stmt is None or (isinstance(t.income_stmt, pd.DataFrame) and t.income_stmt.empty):
-             return {"symbol": ticker.upper(), "message": "No data"}
-        return normalize_value({"income": t.income_stmt, "balance": t.balance_sheet, "cash": t.cashflow})
-    except:
-        raise HTTPException(status_code=404, detail=f"Financials not found for {ticker}")
+        return normalize_value({
+            "income_statement": t.income_stmt,
+            "balance_sheet": t.balance_sheet,
+            "cashflow": t.cashflow
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 
