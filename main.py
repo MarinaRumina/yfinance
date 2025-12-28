@@ -12,7 +12,7 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="YFinance Ultimate API", version="1.5.0")
+app = FastAPI(title="YFinance Ultimate API", version="1.6.0")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -62,23 +62,6 @@ def get_exchange_name(ticker_obj, fast_info):
     except:
         return EXCHANGE_MAP.get(raw, raw)
 
-def get_usd_rate(currency: str):
-    """Улучшенное получение курса валют (с поддержкой ILS/ILA)"""
-    if not currency or currency == "USD": return 1.0
-    # Исправление для израильских агор/шекелей
-    curr_map = {"ILA": "ILS", "ILR": "ILS"}
-    target_curr = curr_map.get(currency.upper(), currency.upper())
-    
-    try:
-        pair = f"{target_curr}USD=X"
-        rate = yf.Ticker(pair).fast_info.get('last_price')
-        if rate is None or np.isnan(rate):
-            inv = yf.Ticker(f"USD{target_curr}=X").fast_info.get('last_price')
-            if inv and inv > 0: rate = 1 / inv
-        return rate or 1.0
-    except:
-        return 1.0
-
 # --- УТИЛИТЫ ---
 
 @app.get("/search", tags=["Utility"])
@@ -113,7 +96,7 @@ def get_multiple_quotes(symbols: str = Query(...)):
             curr = f.get('last_price')
             prev = f.get('previous_close')
             
-            # Если данные пустые (как для ESLT.TA на скрине), берем из истории
+            # Если данные пустые, берем из истории
             if curr is None or np.isnan(curr) or f.get('day_high') is None:
                 h = t.history(period="2d")
                 if not h.empty:
@@ -126,13 +109,10 @@ def get_multiple_quotes(symbols: str = Query(...)):
             else:
                 hi, lo, vo, op = f.get('day_high'), f.get('day_low'), f.get('last_volume'), f.get('open')
 
-            rate = get_usd_rate(f.get('currency'))
-            price_usd = curr * rate if curr else None
             change_pct = ((curr - prev) / prev * 100) if curr and prev else 0
 
             result[symbol] = {
                 "current_price": normalize_value(curr),
-                "current_price_usd": normalize_value(round(price_usd, 2)) if price_usd else None,
                 "change_percent": normalize_value(round(change_pct, 2)),
                 "open": normalize_value(op),
                 "high": normalize_value(hi),
@@ -146,49 +126,51 @@ def get_multiple_quotes(symbols: str = Query(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.websocket("/ws/price/{ticker}")
-async def websocket_price(websocket: WebSocket, ticker: str):
+@app.websocket("/ws/price/{tickers}")
+async def websocket_price(websocket: WebSocket, tickers: str):
+    """
+    WebSocket для получения цен в реальном времени. 
+    Принимает один или несколько тикеров через запятую (напр. AAPL,MSFT,TSLA).
+    """
     await websocket.accept()
-    ticker_sym = ticker.upper()
-    t = yf.Ticker(ticker_sym)
+    ticker_list = [s.strip().upper() for s in tickers.split(",")]
+    # Создаем объекты тикеров заранее для оптимизации
+    ticker_objects = {sym: yf.Ticker(sym) for sym in ticker_list}
+    
     try:
-        # Получаем статические данные один раз при подключении
-        f_init = t.fast_info
-        currency = f_init.get('currency')
-        rate = get_usd_rate(currency)
-        ex_name = get_exchange_name(t, f_init)
-        
         while True:
-            f = t.fast_info
-            curr = f.get('last_price')
-            prev = f.get('previous_close')
-            
-            # Fallback для пустых полей
-            hi, lo, vo = f.get('day_high'), f.get('day_low'), f.get('last_volume')
-            if hi is None or np.isnan(hi):
-                h_data = t.history(period="1d")
-                if not h_data.empty:
-                    curr = h_data['Close'].iloc[-1]
-                    hi, lo, vo = h_data['High'].iloc[-1], h_data['Low'].iloc[-1], h_data['Volume'].iloc[-1]
+            updates = {}
+            for sym, t in ticker_objects.items():
+                f = t.fast_info
+                curr = f.get('last_price')
+                prev = f.get('previous_close')
+                
+                # Проверка данных (fallback на историю)
+                hi, lo, vo = f.get('day_high'), f.get('day_low'), f.get('last_volume')
+                if hi is None or np.isnan(hi):
+                    h_data = t.history(period="1d")
+                    if not h_data.empty:
+                        curr = h_data['Close'].iloc[-1]
+                        hi, lo, vo = h_data['High'].iloc[-1], h_data['Low'].iloc[-1], h_data['Volume'].iloc[-1]
 
-            change_pct = ((curr - prev) / prev * 100) if curr and prev else 0
+                change_pct = ((curr - prev) / prev * 100) if curr and prev else 0
+                
+                updates[sym] = {
+                    "price": normalize_value(curr),
+                    "change_percent": normalize_value(round(change_pct, 2)),
+                    "high": normalize_value(hi),
+                    "low": normalize_value(lo),
+                    "volume": normalize_value(vo),
+                    "time": datetime.now().isoformat()
+                }
             
-            await websocket.send_json({
-                "symbol": ticker_sym,
-                "price": normalize_value(curr),
-                "price_usd": normalize_value(round(curr * rate, 2)) if curr else None,
-                "change_percent": normalize_value(round(change_pct, 2)),
-                "high": normalize_value(hi),
-                "low": normalize_value(lo),
-                "volume": normalize_value(vo),
-                "exchange": ex_name,
-                "time": datetime.now().isoformat()
-            })
-            await asyncio.sleep(2)
+            await websocket.send_json(updates)
+            await asyncio.sleep(2) # Пауза между обновлениями
+    except WebSocketDisconnect:
+        logger.info(f"Client disconnected for tickers: {tickers}")
     except Exception as e:
-        logger.error(f"WS error: {e}")
+        logger.error(f"WS error for {tickers}: {e}")
         await websocket.close()
-
 
 
 # --- ФИНАНСЫ И ОТЧЕТНОСТЬ ---
