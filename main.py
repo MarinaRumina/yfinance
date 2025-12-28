@@ -96,12 +96,10 @@ def search_ticker(query: str = Query(..., description="Название или �
 def get_multiple_quotes(symbols: str = Query(..., description="AAPL,TEVA.TA,LSEG.L")):
     try:
         ticker_list = [s.strip().upper() for s in symbols.split(",")]
-        # Используем yf.Tickers только для инициализации, но опрашиваем в цикле для стабильности
-        tickers = yf.Tickers(" ".join(ticker_list))
         result = {}
 
         for symbol in ticker_list:
-            t = tickers.tickers[symbol]
+            t = yf.Ticker(symbol)
             fast = t.fast_info
             
             curr = fast.get('last_price')
@@ -143,7 +141,7 @@ def get_multiple_quotes(symbols: str = Query(..., description="AAPL,TEVA.TA,LSEG
         return result
     except Exception as e:
         logger.error(f"Quote error: {e}")
-        raise HTTPException(status_code=500, detail="Error fetching quotes")
+        raise HTTPException(status_code=500, detail=f"Error fetching quotes: {str(e)}")
 
 @app.websocket("/ws/price/{ticker}")
 async def websocket_price(websocket: WebSocket, ticker: str):
@@ -183,7 +181,7 @@ async def websocket_price(websocket: WebSocket, ticker: str):
     except WebSocketDisconnect:
         logger.info(f"Client disconnected from {ticker_sym}")
         
-    except Exception as e: # ИСПРАВЛЕНО: добавлено 'as e'
+    except Exception as e:
         logger.error(f"WebSocket error for {ticker_sym}: {e}")
         await websocket.close()
 
@@ -194,13 +192,18 @@ def get_financials(ticker: str):
     """Баланс, Прибыли и Кэшфлоу."""
     try:
         t = yf.Ticker(ticker.upper())
+        # Проверяем, не пустые ли данные, чтобы избежать Internal Server Error
+        if t.income_stmt is None or t.income_stmt.empty:
+             return {"symbol": ticker.upper(), "message": "Financial data not available", "data": {}}
+             
         return normalize_value({
             "income_statement": t.income_stmt,
             "balance_sheet": t.balance_sheet,
             "cashflow": t.cashflow
         })
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Financials error for {ticker}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching financials: {str(e)}")
 
 @app.get("/info/{ticker}", tags=["Information"])
 def get_info(ticker: str):
