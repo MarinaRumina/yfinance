@@ -12,7 +12,7 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="YFinance Ultimate API", version="1.6.0")
+app = FastAPI(title="YFinance Ultimate API", version="1.7.0")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -57,10 +57,10 @@ def normalize_value(v: Any) -> Any:
 def get_exchange_name(ticker_obj, fast_info):
     raw = fast_info.get('exchange')
     try:
-        # Пробуем получить официальное имя, если нет - из словаря
         return ticker_obj.info.get('exchDisp') or EXCHANGE_MAP.get(raw, raw)
     except:
         return EXCHANGE_MAP.get(raw, raw)
+
 
 # --- УТИЛИТЫ ---
 
@@ -87,6 +87,7 @@ def search_ticker(query: str = Query(..., description="Название или �
 
 @app.get("/tickers/quote", tags=["Market Data"])
 def get_multiple_quotes(symbols: str = Query(...)):
+    """Получение котировок для списка тикеров."""
     try:
         ticker_list = [s.strip().upper() for s in symbols.split(",")]
         result = {}
@@ -96,14 +97,13 @@ def get_multiple_quotes(symbols: str = Query(...)):
             curr = f.get('last_price')
             prev = f.get('previous_close')
             
-            # Если данные пустые, берем из истории
-            if curr is None or np.isnan(curr) or f.get('day_high') is None:
-                h = t.history(period="2d")
+            # Если данных нет, подтягиваем из истории (решает проблему 0% изменения)
+            if curr is None or np.isnan(curr) or prev is None or np.isnan(prev):
+                h = t.history(period="5d") # Берем с запасом на выходные
                 if not h.empty:
                     curr = h['Close'].iloc[-1]
-                    prev = h['Close'].iloc[-2] if len(h) > 1 else prev
-                    hi, lo, vo = h['High'].iloc[-1], h['Low'].iloc[-1], h['Volume'].iloc[-1]
-                    op = h['Open'].iloc[-1]
+                    prev = h['Close'].iloc[-2] if len(h) > 1 else curr
+                    hi, lo, vo, op = h['High'].iloc[-1], h['Low'].iloc[-1], h['Volume'].iloc[-1], h['Open'].iloc[-1]
                 else:
                     hi, lo, vo, op = [None]*4
             else:
@@ -125,34 +125,43 @@ def get_multiple_quotes(symbols: str = Query(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.websocket("/ws/price/{tickers}")
 async def websocket_price(websocket: WebSocket, tickers: str):
     """
-    WebSocket для получения цен в реальном времени. 
-    Принимает один или несколько тикеров через запятую (напр. AAPL,MSFT,TSLA).
+    Асинхронный WebSocket для получения цен в реальном времени. 
+    Принимает один или несколько тикеров через запятую (напр. AAPL,ESLT.TA,MSFT,TSLA).
     """
     await websocket.accept()
     ticker_list = [s.strip().upper() for s in tickers.split(",")]
-    # Создаем объекты тикеров заранее для оптимизации
     ticker_objects = {sym: yf.Ticker(sym) for sym in ticker_list}
     
+    # Кэш для цен закрытия, чтобы не дергать историю каждые 2 секунды
+    prev_closes = {}
+
     try:
+        # Первичный сбор цен закрытия для расчета процента
+        for sym, t in ticker_objects.items():
+            pc = t.fast_info.get('previous_close')
+            if pc is None or np.isnan(pc):
+                h = t.history(period="5d")
+                pc = h['Close'].iloc[-2] if len(h) > 1 else (h['Close'].iloc[-1] if not h.empty else None)
+            prev_closes[sym] = pc
+
         while True:
             updates = {}
             for sym, t in ticker_objects.items():
                 f = t.fast_info
                 curr = f.get('last_price')
-                prev = f.get('previous_close')
+                prev = prev_closes.get(sym)
                 
-                # Проверка данных (fallback на историю)
-                hi, lo, vo = f.get('day_high'), f.get('day_low'), f.get('last_volume')
-                if hi is None or np.isnan(hi):
-                    h_data = t.history(period="1d")
-                    if not h_data.empty:
-                        curr = h_data['Close'].iloc[-1]
-                        hi, lo, vo = h_data['High'].iloc[-1], h_data['Low'].iloc[-1], h_data['Volume'].iloc[-1]
+                # Если текущей цены нет в fast_info, берем последнюю из истории
+                if curr is None or np.isnan(curr):
+                    h_today = t.history(period="1d")
+                    curr = h_today['Close'].iloc[-1] if not h_today.empty else None
 
+                hi, lo, vo = f.get('day_high'), f.get('day_low'), f.get('last_volume')
+                
+                # Расчет изменения
                 change_pct = ((curr - prev) / prev * 100) if curr and prev else 0
                 
                 updates[sym] = {
@@ -165,11 +174,12 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                 }
             
             await websocket.send_json(updates)
-            await asyncio.sleep(2) # Пауза между обновлениями
+            await asyncio.sleep(2) 
+            
     except WebSocketDisconnect:
-        logger.info(f"Client disconnected for tickers: {tickers}")
+        logger.info(f"Client disconnected: {tickers}")
     except Exception as e:
-        logger.error(f"WS error for {tickers}: {e}")
+        logger.error(f"WS error: {e}")
         await websocket.close()
 
 
