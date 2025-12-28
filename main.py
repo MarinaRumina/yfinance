@@ -83,12 +83,25 @@ def get_usd_rate(currency: str):
 
 @app.get("/search", tags=["Utility"])
 def search_ticker(query: str = Query(..., description="Название или тикер")):
-    """Поиск тикера по названию или тикеру (напр. Apple или GOOGL)."""
     try:
-        s = yf.Search(query, max_results=10)
-        return {"results": normalize_value(s.quotes)}
+        q = query.strip().upper()
+        s = yf.Search(q, max_results=15)
+        quotes = s.quotes
+        
+        if not quotes:
+            return {"results": []}
+
+        # Сортировка: сначала те, у кого тикер начинается на запрос, потом остальные
+        sorted_quotes = sorted(
+            quotes, 
+            key=lambda x: (not x.get('symbol', '').startswith(q), -x.get('score', 0))
+        )
+        
+        return {"results": normalize_value(sorted_quotes)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Search error: {e}")
+        raise HTTPException(status_code=500, detail="Search service temporarily unavailable")
+
 
 # --- РЫНОЧНЫЕ ДАННЫЕ ---
 
@@ -189,21 +202,30 @@ async def websocket_price(websocket: WebSocket, ticker: str):
 
 @app.get("/financials/{ticker}", tags=["Financials"])
 def get_financials(ticker: str):
-    """Баланс, Прибыли и Кэшфлоу."""
     try:
         t = yf.Ticker(ticker.upper())
-        # Проверяем, не пустые ли данные, чтобы избежать Internal Server Error
-        if t.income_stmt is None or t.income_stmt.empty:
-             return {"symbol": ticker.upper(), "message": "Financial data not available", "data": {}}
-             
-        return normalize_value({
-            "income_statement": t.income_stmt,
-            "balance_sheet": t.balance_sheet,
-            "cashflow": t.cashflow
-        })
+        
+        # Безопасно извлекаем данные. Если таблицы нет - возвращаем пустой словарь.
+        def safe_get_df(df):
+            return df if df is not None and not df.empty else pd.DataFrame()
+
+        data = {
+            "income_statement": safe_get_df(t.income_stmt),
+            "balance_sheet": safe_get_df(t.balance_sheet),
+            "cashflow": safe_get_df(t.cashflow)
+        }
+        
+        # Если вообще все отчеты пустые
+        if all(df.empty for df in data.values()):
+            return {"symbol": ticker.upper(), "message": "No financial data found for this period"}
+            
+        return normalize_value(data)
     except Exception as e:
-        logger.error(f"Financials error for {ticker}: {e}")
-        raise HTTPException(status_code=500, detail=f"Error fetching financials: {str(e)}")
+        logger.error(f"Financials crash for {ticker}: {e}")
+        # Возвращаем 404 вместо 500, если данных просто нет
+        raise HTTPException(status_code=404, detail=f"Financials not found for {ticker}")
+
+
 
 @app.get("/info/{ticker}", tags=["Information"])
 def get_info(ticker: str):
