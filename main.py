@@ -201,7 +201,7 @@ def get_financials(ticker: str):
              return {"symbol": ticker.upper(), "message": "No data"}
         return normalize_value({"income": t.income_stmt, "balance": t.balance_sheet, "cash": t.cashflow})
     except:
-        raise HTTPException(status_code=404, f"Financials not found for {ticker}")
+        raise HTTPException(status_code=404, detail=f"Financials not found for {ticker}")
 
 
 
