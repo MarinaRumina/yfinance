@@ -135,9 +135,9 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     ticker_list = [s.strip().upper() for s in tickers.split(",")]
     ticker_objects = {sym: yf.Ticker(sym) for sym in ticker_list}
     
-    # Кэш для цен закрытия, чтобы не дергать историю каждые 2 секунды
+    # Кэш цен закрытия для расчета change_percent
     prev_closes = {}
-for sym, t in ticker_objects.items():
+    for sym, t in ticker_objects.items():
         pc = t.fast_info.get('previous_close')
         if pc is None or np.isnan(pc):
             h = t.history(period="5d")
