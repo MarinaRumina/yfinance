@@ -137,31 +137,33 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     
     # Кэш для цен закрытия, чтобы не дергать историю каждые 2 секунды
     prev_closes = {}
+for sym, t in ticker_objects.items():
+        pc = t.fast_info.get('previous_close')
+        if pc is None or np.isnan(pc):
+            h = t.history(period="5d")
+            pc = h['Close'].iloc[-2] if len(h) > 1 else (h['Close'].iloc[-1] if not h.empty else None)
+        prev_closes[sym] = pc
 
     try:
-        # Первичный сбор цен закрытия для расчета процента
-        for sym, t in ticker_objects.items():
-            pc = t.fast_info.get('previous_close')
-            if pc is None or np.isnan(pc):
-                h = t.history(period="5d")
-                pc = h['Close'].iloc[-2] if len(h) > 1 else (h['Close'].iloc[-1] if not h.empty else None)
-            prev_closes[sym] = pc
-
         while True:
             updates = {}
             for sym, t in ticker_objects.items():
                 f = t.fast_info
                 curr = f.get('last_price')
-                prev = prev_closes.get(sym)
+                hi = f.get('day_high')
+                lo = f.get('day_low')
+                vo = f.get('last_volume')
                 
-                # Если текущей цены нет в fast_info, берем последнюю из истории
-                if curr is None or np.isnan(curr):
+                # Если high/low/volume равны null, берем из истории за текущий день
+                if hi is None or np.isnan(hi) or vo is None or np.isnan(vo):
                     h_today = t.history(period="1d")
-                    curr = h_today['Close'].iloc[-1] if not h_today.empty else None
+                    if not h_today.empty:
+                        curr = curr or h_today['Close'].iloc[-1]
+                        hi = h_today['High'].iloc[-1]
+                        lo = h_today['Low'].iloc[-1]
+                        vo = h_today['Volume'].iloc[-1]
 
-                hi, lo, vo = f.get('day_high'), f.get('day_low'), f.get('last_volume')
-                
-                # Расчет изменения
+                prev = prev_closes.get(sym)
                 change_pct = ((curr - prev) / prev * 100) if curr and prev else 0
                 
                 updates[sym] = {
