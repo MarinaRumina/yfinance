@@ -79,8 +79,6 @@ def get_usd_rate(currency: str):
     except:
         return 1.0
 
-
-
 # --- УТИЛИТЫ ---
 
 @app.get("/search", tags=["Utility"])
@@ -98,6 +96,7 @@ def search_ticker(query: str = Query(..., description="Название или �
 def get_multiple_quotes(symbols: str = Query(..., description="AAPL,TEVA.TA,LSEG.L")):
     try:
         ticker_list = [s.strip().upper() for s in symbols.split(",")]
+        # Используем yf.Tickers только для инициализации, но опрашиваем в цикле для стабильности
         tickers = yf.Tickers(" ".join(ticker_list))
         result = {}
 
@@ -125,7 +124,7 @@ def get_multiple_quotes(symbols: str = Query(..., description="AAPL,TEVA.TA,LSEG
             price_usd = curr
             if currency and currency != "USD":
                 rate = get_usd_rate(currency)
-                price_usd = curr * rate
+                price_usd = (curr * rate) if curr is not None else None
 
             change_pct = ((curr - prev) / prev * 100) if curr and prev else 0
 
@@ -145,8 +144,6 @@ def get_multiple_quotes(symbols: str = Query(..., description="AAPL,TEVA.TA,LSEG
     except Exception as e:
         logger.error(f"Quote error: {e}")
         raise HTTPException(status_code=500, detail="Error fetching quotes")
-
-
 
 @app.websocket("/ws/price/{ticker}")
 async def websocket_price(websocket: WebSocket, ticker: str):
@@ -175,22 +172,20 @@ async def websocket_price(websocket: WebSocket, ticker: str):
                 "price": normalize_value(curr),
                 "price_usd": normalize_value(round(curr * rate, 2)) if curr else None,
                 "change_percent": normalize_value(round(change_pct, 2)),
-				"high": normalize_value(fast.get('day_high')),
+                "high": normalize_value(fast.get('day_high')),
                 "low": normalize_value(fast.get('day_low')),
                 "volume": normalize_value(fast.get('last_volume')),
                 "exchange": exchange_name,
                 "time": datetime.now().isoformat()
             })
             await asyncio.sleep(2)
-			
-	except WebSocketDisconnect:
+            
+    except WebSocketDisconnect:
         logger.info(f"Client disconnected from {ticker_sym}")
-		
-    except Exception:
-		logger.error(f"WebSocket error for {ticker_sym}: {e}")
+        
+    except Exception as e: # ИСПРАВЛЕНО: добавлено 'as e'
+        logger.error(f"WebSocket error for {ticker_sym}: {e}")
         await websocket.close()
-
-
 
 # --- ФИНАНСЫ И ОТЧЕТНОСТЬ ---
 
@@ -279,7 +274,6 @@ def get_calendar(ticker: str):
 @app.get("/health", tags=["Utility"])
 def health():
     return {"status": "online", "timestamp": datetime.now().isoformat()}
-
 
 if __name__ == "__main__":
     import uvicorn
