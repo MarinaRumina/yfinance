@@ -95,26 +95,20 @@ def get_multiple_quotes(symbols: str = Query(...)):
             t = yf.Ticker(symbol)
             f = t.fast_info
             curr = f.get('last_price')
-            prev = f.get('previous_close')
+            hi, lo, vo = f.get('day_high'), f.get('day_low'), f.get('last_volume')
             
-            # Если данных нет, подтягиваем из истории (решает проблему 0% изменения)
-            if curr is None or np.isnan(curr) or prev is None or np.isnan(prev):
-                h = t.history(period="5d") # Берем с запасом на выходные
+            if hi is None or np.isnan(hi):
+                h = t.history(period="2d")
                 if not h.empty:
                     curr = h['Close'].iloc[-1]
-                    prev = h['Close'].iloc[-2] if len(h) > 1 else curr
-                    hi, lo, vo, op = h['High'].iloc[-1], h['Low'].iloc[-1], h['Volume'].iloc[-1], h['Open'].iloc[-1]
-                else:
-                    hi, lo, vo, op = [None]*4
-            else:
-                hi, lo, vo, op = f.get('day_high'), f.get('day_low'), f.get('last_volume'), f.get('open')
-
+                    hi, lo, vo = h['High'].iloc[-1], h['Low'].iloc[-1], h['Volume'].iloc[-1]
+            
+            prev = f.get('previous_close') or curr
             change_pct = ((curr - prev) / prev * 100) if curr and prev else 0
 
             result[symbol] = {
                 "current_price": normalize_value(curr),
                 "change_percent": normalize_value(round(change_pct, 2)),
-                "open": normalize_value(op),
                 "high": normalize_value(hi),
                 "low": normalize_value(lo),
                 "volume": normalize_value(vo),
@@ -124,6 +118,7 @@ def get_multiple_quotes(symbols: str = Query(...)):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.websocket("/ws/price/{tickers}")
 async def websocket_price(websocket: WebSocket, tickers: str):
