@@ -63,18 +63,18 @@ def get_exchange_name(ticker_obj, fast_info):
         return EXCHANGE_MAP.get(raw, raw)
 
 def get_usd_rate(currency: str):
-    """Получает курс валюты к USD"""
+    """Улучшенное получение курса валют (с поддержкой ILS/ILA)"""
     if not currency or currency == "USD": return 1.0
+    # Исправление для израильских агор/шекелей
+    curr_map = {"ILA": "ILS", "ILR": "ILS"}
+    target_curr = curr_map.get(currency.upper(), currency.upper())
+    
     try:
-        # Для Израиля курс в yfinance обычно ILSUSD=X
-        pair = f"{currency}USD=X"
-        rate_ticker = yf.Ticker(pair)
-        rate = rate_ticker.fast_info.get('last_price')
-        # Если yfinance не нашел прямую пару, пробуем обратную
-        if rate is None:
-            rate_ticker = yf.Ticker(f"USD{currency}=X")
-            inv_rate = rate_ticker.fast_info.get('last_price')
-            if inv_rate: rate = 1 / inv_rate
+        pair = f"{target_curr}USD=X"
+        rate = yf.Ticker(pair).fast_info.get('last_price')
+        if rate is None or np.isnan(rate):
+            inv = yf.Ticker(f"USD{target_curr}=X").fast_info.get('last_price')
+            if inv and inv > 0: rate = 1 / inv
         return rate or 1.0
     except:
         return 1.0
@@ -83,78 +83,68 @@ def get_usd_rate(currency: str):
 
 @app.get("/search", tags=["Utility"])
 def search_ticker(query: str = Query(..., description="Название или тикер")):
+    """Поиск с приоритетом тикеров, начинающихся на запрос"""
     try:
         q = query.strip().upper()
         s = yf.Search(q, max_results=15)
         quotes = s.quotes
-        
-        if not quotes:
-            return {"results": []}
-
-        # Сортировка: сначала те, у кого тикер начинается на запрос, потом остальные
+        if not quotes: return {"results": []}
+        # Сортировка: сначала совпадения по началу тикера, потом по весу (score)
         sorted_quotes = sorted(
             quotes, 
             key=lambda x: (not x.get('symbol', '').startswith(q), -x.get('score', 0))
         )
-        
         return {"results": normalize_value(sorted_quotes)}
     except Exception as e:
         logger.error(f"Search error: {e}")
-        raise HTTPException(status_code=500, detail="Search service temporarily unavailable")
+        raise HTTPException(status_code=500, detail="Search failed")
 
 
 # --- РЫНОЧНЫЕ ДАННЫЕ ---
 
 @app.get("/tickers/quote", tags=["Market Data"])
-def get_multiple_quotes(symbols: str = Query(..., description="AAPL,TEVA.TA,LSEG.L")):
+def get_multiple_quotes(symbols: str = Query(...)):
     try:
         ticker_list = [s.strip().upper() for s in symbols.split(",")]
         result = {}
-
         for symbol in ticker_list:
             t = yf.Ticker(symbol)
-            fast = t.fast_info
+            f = t.fast_info
+            curr = f.get('last_price')
+            prev = f.get('previous_close')
             
-            curr = fast.get('last_price')
-            prev = fast.get('previous_close')
-            
-            # ЗАЩИТА ОТ ПУСТЫХ ДАННЫХ (ПРАЗДНИКИ ДО 30 ДНЕЙ)
-            if curr is None or np.isnan(curr):
-                hist = t.history(period="1mo")
-                if not hist.empty:
-                    curr = hist['Close'].iloc[-1]
-                    prev = hist['Close'].iloc[-2] if len(hist) > 1 else curr
-                    o, h, l, v = hist['Open'].iloc[-1], hist['High'].iloc[-1], hist['Low'].iloc[-1], hist['Volume'].iloc[-1]
+            # Если данные пустые (как для ESLT.TA на скрине), берем из истории
+            if curr is None or np.isnan(curr) or f.get('day_high') is None:
+                h = t.history(period="2d")
+                if not h.empty:
+                    curr = h['Close'].iloc[-1]
+                    prev = h['Close'].iloc[-2] if len(h) > 1 else prev
+                    hi, lo, vo = h['High'].iloc[-1], h['Low'].iloc[-1], h['Volume'].iloc[-1]
+                    op = h['Open'].iloc[-1]
                 else:
-                    curr, prev, o, h, l, v = [None]*6
+                    hi, lo, vo, op = [None]*4
             else:
-                o, h, l, v = fast.get('open'), fast.get('day_high'), fast.get('day_low'), fast.get('last_volume')
+                hi, lo, vo, op = f.get('day_high'), f.get('day_low'), f.get('last_volume'), f.get('open')
 
-            # КОНВЕРТАЦИЯ В USD
-            currency = fast.get('currency')
-            price_usd = curr
-            if currency and currency != "USD":
-                rate = get_usd_rate(currency)
-                price_usd = (curr * rate) if curr is not None else None
-
+            rate = get_usd_rate(f.get('currency'))
+            price_usd = curr * rate if curr else None
             change_pct = ((curr - prev) / prev * 100) if curr and prev else 0
 
             result[symbol] = {
                 "current_price": normalize_value(curr),
                 "current_price_usd": normalize_value(round(price_usd, 2)) if price_usd else None,
                 "change_percent": normalize_value(round(change_pct, 2)),
-                "previous_close": normalize_value(prev),
-                "open": normalize_value(o),
-                "high": normalize_value(h),
-                "low": normalize_value(l),
-                "volume": normalize_value(v),
-                "exchange": get_exchange_name(t, fast),
-                "currency": currency
+                "open": normalize_value(op),
+                "high": normalize_value(hi),
+                "low": normalize_value(lo),
+                "volume": normalize_value(vo),
+                "currency": f.get('currency'),
+                "exchange": get_exchange_name(t, f)
             }
         return result
     except Exception as e:
-        logger.error(f"Quote error: {e}")
-        raise HTTPException(status_code=500, detail=f"Error fetching quotes: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.websocket("/ws/price/{ticker}")
 async def websocket_price(websocket: WebSocket, ticker: str):
@@ -162,68 +152,56 @@ async def websocket_price(websocket: WebSocket, ticker: str):
     ticker_sym = ticker.upper()
     t = yf.Ticker(ticker_sym)
     try:
-        prev_close = t.fast_info.get('previous_close')
-        exchange_name = get_exchange_name(t, t.fast_info)
-        currency = t.fast_info.get('currency')
-        rate = get_usd_rate(currency) if currency != "USD" else 1.0
-
+        # Получаем статические данные один раз при подключении
+        f_init = t.fast_info
+        currency = f_init.get('currency')
+        rate = get_usd_rate(currency)
+        ex_name = get_exchange_name(t, f_init)
+        
         while True:
-            fast = t.fast_info
-            curr = fast.get('last_price')
+            f = t.fast_info
+            curr = f.get('last_price')
+            prev = f.get('previous_close')
             
-            # ЗАЩИТА ДЛЯ СОКЕТА
-            if curr is None or np.isnan(curr):
-                hist = t.history(period="1d")
-                curr = hist['Close'].iloc[-1] if not hist.empty else None
+            # Fallback для пустых полей
+            hi, lo, vo = f.get('day_high'), f.get('day_low'), f.get('last_volume')
+            if hi is None or np.isnan(hi):
+                h_data = t.history(period="1d")
+                if not h_data.empty:
+                    curr = h_data['Close'].iloc[-1]
+                    hi, lo, vo = h_data['High'].iloc[-1], h_data['Low'].iloc[-1], h_data['Volume'].iloc[-1]
 
-            change_pct = ((curr - prev_close) / prev_close * 100) if curr and prev_close else 0
+            change_pct = ((curr - prev) / prev * 100) if curr and prev else 0
             
             await websocket.send_json({
                 "symbol": ticker_sym,
                 "price": normalize_value(curr),
                 "price_usd": normalize_value(round(curr * rate, 2)) if curr else None,
                 "change_percent": normalize_value(round(change_pct, 2)),
-                "high": normalize_value(fast.get('day_high')),
-                "low": normalize_value(fast.get('day_low')),
-                "volume": normalize_value(fast.get('last_volume')),
-                "exchange": exchange_name,
+                "high": normalize_value(hi),
+                "low": normalize_value(lo),
+                "volume": normalize_value(vo),
+                "exchange": ex_name,
                 "time": datetime.now().isoformat()
             })
             await asyncio.sleep(2)
-            
-    except WebSocketDisconnect:
-        logger.info(f"Client disconnected from {ticker_sym}")
-        
     except Exception as e:
-        logger.error(f"WebSocket error for {ticker_sym}: {e}")
+        logger.error(f"WS error: {e}")
         await websocket.close()
+
+
 
 # --- ФИНАНСЫ И ОТЧЕТНОСТЬ ---
 
-@app.get("/financials/{ticker}", tags=["Financials"])
 def get_financials(ticker: str):
     try:
         t = yf.Ticker(ticker.upper())
-        
-        # Безопасно извлекаем данные. Если таблицы нет - возвращаем пустой словарь.
-        def safe_get_df(df):
-            return df if df is not None and not df.empty else pd.DataFrame()
-
-        data = {
-            "income_statement": safe_get_df(t.income_stmt),
-            "balance_sheet": safe_get_df(t.balance_sheet),
-            "cashflow": safe_get_df(t.cashflow)
-        }
-        
-        # Если вообще все отчеты пустые
-        if all(df.empty for df in data.values()):
-            return {"symbol": ticker.upper(), "message": "No financial data found for this period"}
-            
-        return normalize_value(data)
-    except Exception as e:
-        logger.error(f"Financials crash for {ticker}: {e}")
-        # Возвращаем 404 вместо 500, если данных просто нет
-        raise HTTPException(status_code=404, detail=f"Financials not found for {ticker}")
+        # Жесткая проверка на наличие данных
+        if t.income_stmt is None or (isinstance(t.income_stmt, pd.DataFrame) and t.income_stmt.empty):
+             return {"symbol": ticker.upper(), "message": "No data"}
+        return normalize_value({"income": t.income_stmt, "balance": t.balance_sheet, "cash": t.cashflow})
+    except:
+        raise HTTPException(status_code=404, f"Financials not found for {ticker}")
 
 
 
