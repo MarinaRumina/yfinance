@@ -192,7 +192,7 @@ async def websocket_price(websocket: WebSocket, ticker: str):
 
 
 # --- ФИНАНСЫ И ОТЧЕТНОСТЬ ---
-
+@app.get("/financials/{ticker}", tags=["Financials"])
 def get_financials(ticker: str):
     try:
         t = yf.Ticker(ticker.upper())
