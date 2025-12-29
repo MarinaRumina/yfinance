@@ -202,6 +202,9 @@ async def websocket_price(websocket: WebSocket, tickers: str):
         logger.error(f"WS error: {e}")
         await websocket.close()
 
+
+# --- ИСТОРИЧЕСКИЕ ДАННЫЕ ---
+
 @app.get("/history/{ticker}", tags=["Historical Data"])
 def get_history(ticker: str, period: str = "1mo", interval: str = "1d"):
     """
@@ -213,6 +216,37 @@ def get_history(ticker: str, period: str = "1mo", interval: str = "1d"):
     hist = t.history(period=period, interval=interval)
     return normalize_value(hist)
 
+@app.get("/tickers/history", tags=["Historical Data"])
+def get_multiple_histories(
+    symbols: str = Query(..., description="Тикеры через запятую, например: AAPL,TSLA,MSFT"), 
+    period: str = "1mo", 
+    interval: str = "1d"
+):
+    """
+    Получение истории для нескольких тикеров сразу.
+    Возвращает словарь: { "AAPL": [свечи], "TSLA": [свечи] }
+    """
+    ticker_list = [s.strip().upper() for s in symbols.split(",")]
+    result = {}
+
+    for symbol in ticker_list:
+        try:
+            t = yf.Ticker(symbol)
+            # Мы используем те же параметры period и interval
+            hist = t.history(period=period, interval=interval)
+            
+            if not hist.empty:
+                # normalize_value превратит DataFrame в список словарей (records)
+                # где дата будет отдельным полем.
+                result[symbol] = normalize_value(hist)
+            else:
+                result[symbol] = [] # Если данных нет, возвращаем пустой массив
+                
+        except Exception as e:
+            logger.error(f"Error fetching history for {symbol}: {e}")
+            result[symbol] = {"error": str(e)}
+
+    return result
 
 # --- УТИЛИТЫ ---
 @app.get("/search", tags=["Utility"])
