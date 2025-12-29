@@ -52,15 +52,21 @@ def get_ticker_base_data(symbol: str, t_obj):
         return BASE_DATA_CACHE[symbol]
 
     try:
-        # Берем историю для объема вчера и цен закрытия
+        # Берем историю за 10 дней для расчета среднего объема и объема вчера
         h = t_obj.history(period="10d")
         if h.empty: return None
 
         last_row = h.iloc[-1]
         prev_row = h.iloc[-2] if len(h) > 1 else last_row
         
-        # Получаем средний объем (обычно за 10 дней или из info)
-        avg_vol = t_obj.info.get('averageVolume') or h['Volume'].mean()
+        # Средний объем (пытаемся взять из info, если нет - считаем среднее за 10 дней)
+        avg_vol = None
+        try:
+            avg_vol = t_obj.info.get('averageVolume')
+        except:
+            pass
+        if not avg_vol:
+            avg_vol = h['Volume'].mean()
         
         base_info = {
             "open": last_row['Open'],
@@ -76,46 +82,44 @@ def get_ticker_base_data(symbol: str, t_obj):
         BASE_DATA_CACHE[symbol] = base_info
         return base_info
     except Exception as e:
-        logger.error(f"Error caching base data for {symbol}: {e}")
+        logger.error(f"Error caching data for {symbol}: {e}")
         return None
 
 def get_combined_quote(symbol: str):
     t = yf.Ticker(symbol)
     
-    # 1. ЗАГРУЗКА БАЗОВЫХ ДАННЫХ (КЭШ)
+    # ЗАГРУЗКА БАЗОВЫХ ДАННЫХ (КЭШ)
     # Здесь лежат: open, prev_close, prev_day_volume, average_volume
     # А также high и low, зафиксированные на начало дня.
     base = get_ticker_base_data(symbol, t)
     if not base: return None
 
-    # 2. ПОПЫТКА №1: БЫСТРЫЕ ДАННЫЕ (Basic Info)
-    b = t.basic_info
-    curr = b.get('last_price')
-    live_vol = b.get('last_volume')
-    live_hi = b.get('day_high')
-    live_lo = b.get('day_low')
+    # Попытка №1: Используем fast_info (вместо basic_info)
+    f = t.fast_info
+    curr = getattr(f, 'last_price', None)
+    live_vol = getattr(f, 'last_volume', None)
+    live_hi = getattr(f, 'day_high', None)
+    live_lo = getattr(f, 'day_low', None)
 
-    # 3. ПОПЫТКА №2: ОБХОД ЗАДЕРЖЕК (Fallback)
-    # Если цена совпадает со вчерашним закрытием (рынок спит?) 
-    # или объем равен 0/объему вчера, проверяем минутные свечи.
-    if curr == base['prev_close'] or live_vol == 0 or live_vol == base['prev_day_volume']:
+    # Попытка №2: Если данные застыли (рынок открыт, но fast_info не обновляется)
+    # Сравниваем текущую цену с закрытием вчера и объем с 0
+    if curr is None or curr == base['prev_close'] or live_vol == 0:
         h_live = t.history(period="1d", interval="1m")
         if not h_live.empty:
             curr = h_live['Close'].iloc[-1]
-            # Для объема: берем либо накопленный из истории, либо максимум
+            # Объем из истории часто более точный для не-US рынков
             live_vol = h_live['Volume'].sum() 
             live_hi = max(live_hi or 0, h_live['High'].max())
             live_lo = min(live_lo or 99999999, h_live['Low'].min())
 
-    # 4. --- ОБНОВЛЕНИЕ КЭША (High/Low/Volume) ---
+    # --- ОБНОВЛЕНИЕ КЭША В РЕАЛЬНОМ ВРЕМЕНИ (High/Low/Volume) ---
     # Если за эту секунду мы увидели новый High, который выше того, 
     # что в нашем кэше base — перезаписываем его в кэш.
-    if live_hi and (np.isnan(base['high']) or live_hi > base['high']):
+    if live_hi and (np.isnan(base['high']) or live_hi > base['high']): 
         base['high'] = live_hi
-
-    if live_lo and (np.isnan(base['low']) or live_lo < base['low']):
+    if live_lo and (np.isnan(base['low']) or live_lo < base['low']): 
         base['low'] = live_lo
-
+    
     # Объем: Yahoo иногда присылает 0 в середине дня. 
     # Мы берем максимальное значение (так как объем в течение дня только растет).
     current_vol = max(live_vol or 0, base['volume'] or 0)
@@ -124,7 +128,8 @@ def get_combined_quote(symbol: str):
 
     # 5. РАСЧЕТ ПРОЦЕНТА ИЗМЕНЕНИЯ
     # Считаем от цены открытия (open), если она есть. Если нет — от prev_close.
-    base_price = base['open'] if base['open'] and not np.isnan(base['open']) else base['prev_close']
+    op = base['open']
+    base_price = op if op and not np.isnan(op) else base['prev_close']
     pct = ((curr - base_price) / base_price * 100) if curr and base_price else 0
 
     return {
@@ -132,39 +137,19 @@ def get_combined_quote(symbol: str):
         "current_price": curr,
         "change_percent": round(pct, 2),
         "open": base['open'],
-        "high": base['high'],        # Берем из нашего обновленного кэша
-        "low": base['low'],          # Берем из нашего обновленного кэша
-        "volume": current_vol,       # Актуальный объем за сегодня
+        "high": base['high'],
+        "low": base['low'],
+        "volume": current_vol,
         "previous_close": base['prev_close'],
-        "previous_day_volume": base['prev_day_volume'], # Статика из истории
-        "average_volume": base['average_volume'],       # Статика из истории/инфо
+        "previous_day_volume": base['prev_day_volume'],
+        "average_volume": base['average_volume'],
         "date": base['data_date'],
-        "currency": b.get('currency') or "USD",
-        "exchange": EXCHANGE_MAP.get(b.get('exchange'), b.get('exchange'))
+        "currency": getattr(f, 'currency', 'USD'),
+        "exchange": EXCHANGE_MAP.get(getattr(f, 'exchange', ''), getattr(f, 'exchange', ''))
     }
 
 
 # --- ENDPOINTS ---
-
-# --- УТИЛИТЫ ---
-
-@app.get("/search", tags=["Utility"])
-def search_ticker(query: str = Query(..., description="Название или тикер")):
-    """Поиск с приоритетом тикеров, начинающихся на запрос"""
-    try:
-        q = query.strip().upper()
-        s = yf.Search(q, max_results=15)
-        quotes = s.quotes
-        if not quotes: return {"results": []}
-        sorted_quotes = sorted(
-            quotes, 
-            key=lambda x: (not x.get('symbol', '').startswith(q), -x.get('score', 0))
-        )
-        return {"results": normalize_value(sorted_quotes)}
-    except Exception as e:
-        logger.error(f"Search error: {e}")
-        raise HTTPException(status_code=500, detail="Search failed")
-
 
 # --- РЫНОЧНЫЕ ДАННЫЕ ---
 
@@ -180,8 +165,8 @@ def get_multiple_quotes(symbols: str = Query(...)):
                 result[symbol] = normalize_value(data)
         return result
     except Exception as e:
+        logger.error(f"Quote error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.websocket("/ws/price/{tickers}")
 async def websocket_price(websocket: WebSocket, tickers: str):
@@ -210,12 +195,42 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                         "time": datetime.now().isoformat()
                     }
             await websocket.send_json(updates)
-            await asyncio.sleep(2)
+            await asyncio.sleep(2) 
     except WebSocketDisconnect:
-        logger.info(f"Client disconnected: {tickers}")
+        logger.info(f"WS Disconnected: {tickers}")
     except Exception as e:
         logger.error(f"WS error: {e}")
         await websocket.close()
+
+@app.get("/history/{ticker}", tags=["Historical Data"])
+def get_history(ticker: str, period: str = "1mo", interval: str = "1d"):
+    """
+    Исторические данные OHLC + Volume + Dividends + Splits.
+    Data aggregation interval ("1h", "1d", "1wk", "1mo"). Default value : 1mo.
+    Available values : 1h, 1d, 1wk, 1mo. Default value : 1d.
+    """
+    t = yf.Ticker(ticker.upper())
+    hist = t.history(period=period, interval=interval)
+    return normalize_value(hist)
+
+
+# --- УТИЛИТЫ ---
+@app.get("/search", tags=["Utility"])
+def search_ticker(query: str = Query(..., description="Название или тикер")):
+    """Поиск с приоритетом тикеров, начинающихся на запрос"""
+    try:
+        q = query.strip().upper()
+        s = yf.Search(q, max_results=15)
+        quotes = s.quotes
+        if not quotes: return {"results": []}
+        sorted_quotes = sorted(
+            quotes, 
+            key=lambda x: (not x.get('symbol', '').startswith(q), -x.get('score', 0))
+        )
+        return {"results": normalize_value(sorted_quotes)}
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        raise HTTPException(status_code=500, detail="Search failed")
 
 
 # --- ФИНАНСЫ И ОТЧЕТНОСТЬ ---
@@ -233,20 +248,16 @@ def get_financials(ticker: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/info/{ticker}", tags=["Information"])
+@app.get("/info/{ticker}", tags=["Full Data"])
 def get_info(ticker: str):
     """Полная информация о компании."""
     t = yf.Ticker(ticker.upper())
     return normalize_value(t.info)
 
-@app.get("/history/{ticker}", tags=["Market Data"])
-def get_history(ticker: str, period: str = "1mo", interval: str = "1d"):
-    """Исторические данные OHLC + Volume + Dividends + Splits."""
-    t = yf.Ticker(ticker.upper())
-    hist = t.history(period=period, interval=interval)
-    return normalize_value(hist)
+
 
 # --- КОРПОРАТИВНЫЕ СОБЫТИЯ ---
+
 @app.get("/dividends/{ticker}", tags=["Corporate Actions"])
 def get_dividends(ticker: str):
     """История дивидендов."""
@@ -273,6 +284,21 @@ def get_actions(ticker: str):
         return {"symbol": ticker.upper(), "message": "No actions found", "data": []}
     return normalize_value(t.actions)
 
+
+# --- ДОПОЛНИТЕЛЬНЫЕ ЭНДПОИНТЫ ---
+
+@app.get("/calendar/{ticker}", tags=["Information"])
+def get_calendar(ticker: str):
+    """Календарь событий (отчеты, дивиденды)."""
+    t = yf.Ticker(ticker.upper())
+    return normalize_value(t.calendar)
+
+@app.get("/news/{ticker}", tags=["Information"])
+def get_news(ticker: str):
+    """Последние новости по тикеру."""
+    t = yf.Ticker(ticker.upper())
+    return normalize_value(t.news)
+
 @app.get("/holders/{ticker}", tags=["Information"])
 def get_holders(ticker: str):
     """Крупнейшие держатели акций."""
@@ -282,25 +308,12 @@ def get_holders(ticker: str):
         "institutional": t.institutional_holders
     })
 
-# --- ДОПОЛНИТЕЛЬНЫЕ ЭНДПОИНТЫ ---
-
-@app.get("/news/{ticker}", tags=["Information"])
-def get_news(ticker: str):
-    """Последние новости по тикеру."""
-    t = yf.Ticker(ticker.upper())
-    return normalize_value(t.news)
-
 @app.get("/recommendations/{ticker}", tags=["Information"])
 def get_recommendations(ticker: str):
     """Рекомендации аналитиков."""
     t = yf.Ticker(ticker.upper())
     return normalize_value(t.recommendations)
 
-@app.get("/calendar/{ticker}", tags=["Information"])
-def get_calendar(ticker: str):
-    """Календарь событий (отчеты, дивиденды)."""
-    t = yf.Ticker(ticker.upper())
-    return normalize_value(t.calendar)
 
 @app.get("/health", tags=["Utility"])
 def health():
