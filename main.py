@@ -12,12 +12,12 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="YFinance Ultimate API", version="2.0.0")
+app = FastAPI(title="YFinance Ultimate API", version="2.1.0")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # --- ГЛОБАЛЬНЫЙ КЭШ ДЛЯ СТАТИЧНЫХ ДАННЫХ ДНЯ ---
-# Мы храним здесь: open, prev_close, high, low, volume и дату актуальности.
+# Структура: {"AAPL": {"open": 150.0, "high": 155.0, ... "cache_date": "2025-12-29"}}
 BASE_DATA_CACHE = {}
 
 # --- СЛОВАРЬ БИРЖ ---
@@ -45,15 +45,14 @@ def normalize_value(v: Any) -> Any:
     return v
 
 def get_ticker_base_data(symbol: str, t_obj):
-    """Обновляет кэш базовых данных (open/prev_close) раз в день."""
+    """Обновляет или создает базовую запись в кэше (раз в сутки)."""
     today_str = datetime.now().strftime('%Y-%m-%d')
     
-    # Если данные уже есть в кэше и они за сегодня — отдаем их
     if symbol in BASE_DATA_CACHE and BASE_DATA_CACHE[symbol]['cache_date'] == today_str:
         return BASE_DATA_CACHE[symbol]
 
-    # Если нет — лезем в историю (берем 5 дней на случай выходных)
     try:
+        # Берем 5 дней истории, чтобы гарантированно найти торговый день (даже после выходных)
         h = t_obj.history(period="5d")
         if h.empty: return None
 
@@ -72,11 +71,14 @@ def get_ticker_base_data(symbol: str, t_obj):
         BASE_DATA_CACHE[symbol] = base_info
         return base_info
     except Exception as e:
-        logger.error(f"Error caching base data for {symbol}: {e}")
+        logger.error(f"Error caching data for {symbol}: {e}")
         return None
 
 def get_combined_quote(symbol: str):
-    """Собирает воедино быстрые данные и данные из кэша."""
+    """
+    Основная логика сбора данных. 
+    Объединяет быстрые данные с кэшем и обновляет High/Low/Volume в реальном времени.
+    """
     t = yf.Ticker(symbol)
     f = t.fast_info
     base = get_ticker_base_data(symbol, t)
@@ -85,18 +87,35 @@ def get_combined_quote(symbol: str):
 
     curr = f.get('last_price') or base['prev_close']
     
-    # Логика процента: если есть цена открытия — считаем от нее (интрадей), 
-    # если рынок еще не открылся — от вчерашнего закрытия.
-    base_price = base['open'] if base['open'] and not np.isnan(base['open']) else base['prev_close']
-    pct = ((curr - base_price) / base_price * 100) if curr and base_price else 0
+    # --- ДИНАМИЧЕСКОЕ ОБНОВЛЕНИЕ КЭША ---
+    # Обновляем максимумы/минимумы дня, если текущие данные выше/ниже кэшированных
+    live_high = f.get('day_high')
+    if live_high and (np.isnan(base['high']) or live_high > base['high']):
+        base['high'] = live_high
+
+    live_low = f.get('day_low')
+    if live_low and (np.isnan(base['low']) or live_low < base['low']):
+        base['low'] = live_low
+
+    live_vol = f.get('last_volume')
+    if live_vol and (np.isnan(base['volume']) or live_vol > base['volume']):
+        base['volume'] = live_vol
+    # -----------------------------------
+
+    # Расчет процента изменения
+    # Если есть цена открытия — считаем от нее, иначе от вчерашнего закрытия
+    op = base['open']
+    base_for_pct = op if op and not np.isnan(op) else base['prev_close']
+    pct = ((curr - base_for_pct) / base_for_pct * 100) if curr and base_for_pct else 0
 
     return {
+        "symbol": symbol,
         "current_price": curr,
         "change_percent": round(pct, 2),
         "open": base['open'],
-        "high": f.get('day_high') or base['high'],
-        "low": f.get('day_low') or base['low'],
-        "volume": f.get('last_volume') or base['volume'],
+        "high": base['high'],
+        "low": base['low'],
+        "volume": base['volume'],
         "previous_close": base['prev_close'],
         "date": base['data_date'],
         "currency": f.get('currency'),
@@ -127,7 +146,7 @@ def search_ticker(query: str = Query(..., description="Название или �
 
 @app.get("/tickers/quote", tags=["Market Data"])
 def get_multiple_quotes(symbols: str = Query(...)):
-    """Получение котировок с использованием кэша статики."""
+    """Получение котировок для списка тикеров с использованием кэша."""
     try:
         ticker_list = [s.strip().upper() for s in symbols.split(",")]
         result = {}
@@ -142,7 +161,10 @@ def get_multiple_quotes(symbols: str = Query(...)):
 
 @app.websocket("/ws/price/{tickers}")
 async def websocket_price(websocket: WebSocket, tickers: str):
-    """Асинхронный WebSocket для нескольких тикеров с кэшем."""
+    """
+    Асинхронный WebSocket для нескольких тикеров (через запятую).
+    Использует кэширование и обновляет High/Low в реальном времени.
+    """
     await websocket.accept()
     ticker_list = [s.strip().upper() for s in tickers.split(",")]
     try:
@@ -256,6 +278,7 @@ def get_calendar(ticker: str):
 
 @app.get("/health", tags=["Utility"])
 def health():
+    """Проверка состояния API и размера кэша."""
     return {
         "status": "online", 
         "timestamp": datetime.now().isoformat(),
@@ -264,5 +287,6 @@ def health():
 
 if __name__ == "__main__":
     import uvicorn
+    # Render использует переменную окружения PORT
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
