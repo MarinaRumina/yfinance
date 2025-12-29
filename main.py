@@ -291,6 +291,16 @@ def get_info(ticker: str):
     return normalize_value(t.info)
 
 
+# --- ФИНАНСОВЫЕ ДАННЫЕ ---
+@app.get("/financials/{ticker}", tags=["Financial Data"])
+def get_financials(ticker: str):
+    t = yf.Ticker(ticker.upper())
+    return normalize_value({
+        "income": t.income_stmt, 
+        "balance": t.balance_sheet, 
+        "cash": t.cashflow
+    })
+
 
 # --- КОРПОРАТИВНЫЕ СОБЫТИЯ ---
 
