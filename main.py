@@ -45,23 +45,28 @@ def normalize_value(v: Any) -> Any:
     return v
 
 def get_ticker_base_data(symbol: str, t_obj):
-    """Обновляет или создает базовую запись в кэше (раз в сутки)."""
+    """Обновляет кэш (open, prev_close, avg_vol, prev_vol) раз в сутки."""
     today_str = datetime.now().strftime('%Y-%m-%d')
     
     if symbol in BASE_DATA_CACHE and BASE_DATA_CACHE[symbol]['cache_date'] == today_str:
         return BASE_DATA_CACHE[symbol]
 
     try:
-        # Берем 5 дней истории, чтобы гарантированно найти торговый день (даже после выходных)
-        h = t_obj.history(period="5d")
+        # Берем историю для объема вчера и цен закрытия
+        h = t_obj.history(period="10d")
         if h.empty: return None
 
         last_row = h.iloc[-1]
         prev_row = h.iloc[-2] if len(h) > 1 else last_row
         
+        # Получаем средний объем (обычно за 10 дней или из info)
+        avg_vol = t_obj.info.get('averageVolume') or h['Volume'].mean()
+        
         base_info = {
             "open": last_row['Open'],
             "prev_close": prev_row['Close'],
+            "prev_day_volume": prev_row['Volume'],
+            "average_volume": avg_vol,
             "high": last_row['High'],
             "low": last_row['Low'],
             "volume": last_row['Volume'],
@@ -71,56 +76,75 @@ def get_ticker_base_data(symbol: str, t_obj):
         BASE_DATA_CACHE[symbol] = base_info
         return base_info
     except Exception as e:
-        logger.error(f"Error caching data for {symbol}: {e}")
+        logger.error(f"Error caching base data for {symbol}: {e}")
         return None
 
 def get_combined_quote(symbol: str):
-    """
-    Основная логика сбора данных. 
-    Объединяет быстрые данные с кэшем и обновляет High/Low/Volume в реальном времени.
-    """
     t = yf.Ticker(symbol)
-    f = t.fast_info
-    base = get_ticker_base_data(symbol, t)
     
+    # 1. ЗАГРУЗКА БАЗОВЫХ ДАННЫХ (КЭШ)
+    # Здесь лежат: open, prev_close, prev_day_volume, average_volume
+    # А также high и low, зафиксированные на начало дня.
+    base = get_ticker_base_data(symbol, t)
     if not base: return None
 
-    curr = f.get('last_price') or base['prev_close']
-    
-    # --- ДИНАМИЧЕСКОЕ ОБНОВЛЕНИЕ КЭША ---
-    # Обновляем максимумы/минимумы дня, если текущие данные выше/ниже кэшированных
-    live_high = f.get('day_high')
-    if live_high and (np.isnan(base['high']) or live_high > base['high']):
-        base['high'] = live_high
+    # 2. ПОПЫТКА №1: БЫСТРЫЕ ДАННЫЕ (Basic Info)
+    b = t.basic_info
+    curr = b.get('last_price')
+    live_vol = b.get('last_volume')
+    live_hi = b.get('day_high')
+    live_lo = b.get('day_low')
 
-    live_low = f.get('day_low')
-    if live_low and (np.isnan(base['low']) or live_low < base['low']):
-        base['low'] = live_low
+    # 3. ПОПЫТКА №2: ОБХОД ЗАДЕРЖЕК (Fallback)
+    # Если цена совпадает со вчерашним закрытием (рынок спит?) 
+    # или объем равен 0/объему вчера, проверяем минутные свечи.
+    if curr == base['prev_close'] or live_vol == 0 or live_vol == base['prev_day_volume']:
+        h_live = t.history(period="1d", interval="1m")
+        if not h_live.empty:
+            curr = h_live['Close'].iloc[-1]
+            # Для объема: берем либо накопленный из истории, либо максимум
+            live_vol = h_live['Volume'].sum() 
+            live_hi = max(live_hi or 0, h_live['High'].max())
+            live_lo = min(live_lo or 99999999, h_live['Low'].min())
 
-    live_vol = f.get('last_volume')
-    if live_vol and (np.isnan(base['volume']) or live_vol > base['volume']):
-        base['volume'] = live_vol
-    # -----------------------------------
+    # 4. --- ОБНОВЛЕНИЕ КЭША (High/Low/Volume) ---
+    # Если за эту секунду мы увидели новый High, который выше того, 
+    # что в нашем кэше base — перезаписываем его в кэш.
+    if live_hi and (np.isnan(base['high']) or live_hi > base['high']):
+        base['high'] = live_hi
 
-    # Расчет процента изменения
-    # Если есть цена открытия — считаем от нее, иначе от вчерашнего закрытия
-    op = base['open']
-    base_for_pct = op if op and not np.isnan(op) else base['prev_close']
-    pct = ((curr - base_for_pct) / base_for_pct * 100) if curr and base_for_pct else 0
+    if live_lo and (np.isnan(base['low']) or live_lo < base['low']):
+        base['low'] = live_lo
+
+    # Объем: Yahoo иногда присылает 0 в середине дня. 
+    # Мы берем максимальное значение (так как объем в течение дня только растет).
+    current_vol = max(live_vol or 0, base['volume'] or 0)
+    base['volume'] = current_vol # сохраняем в кэш
+    # --------------------------------------------
+
+    # 5. РАСЧЕТ ПРОЦЕНТА ИЗМЕНЕНИЯ
+    # Считаем от цены открытия (open), если она есть. Если нет — от prev_close.
+    base_price = base['open'] if base['open'] and not np.isnan(base['open']) else base['prev_close']
+    pct = ((curr - base_price) / base_price * 100) if curr and base_price else 0
 
     return {
         "symbol": symbol,
         "current_price": curr,
         "change_percent": round(pct, 2),
         "open": base['open'],
-        "high": base['high'],
-        "low": base['low'],
-        "volume": base['volume'],
+        "high": base['high'],        # Берем из нашего обновленного кэша
+        "low": base['low'],          # Берем из нашего обновленного кэша
+        "volume": current_vol,       # Актуальный объем за сегодня
         "previous_close": base['prev_close'],
+        "previous_day_volume": base['prev_day_volume'], # Статика из истории
+        "average_volume": base['average_volume'],       # Статика из истории/инфо
         "date": base['data_date'],
-        "currency": f.get('currency'),
-        "exchange": EXCHANGE_MAP.get(f.get('exchange'), f.get('exchange'))
+        "currency": b.get('currency') or "USD",
+        "exchange": EXCHANGE_MAP.get(b.get('exchange'), b.get('exchange'))
     }
+
+
+# --- ENDPOINTS ---
 
 # --- УТИЛИТЫ ---
 
@@ -180,11 +204,13 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                         "high": normalize_value(data['high']),
                         "low": normalize_value(data['low']),
                         "volume": normalize_value(data['volume']),
+                        "previous_day_volume": normalize_value(data['previous_day_volume']),
+                        "average_volume": normalize_value(data['average_volume']),
                         "date": data['date'],
                         "time": datetime.now().isoformat()
                     }
             await websocket.send_json(updates)
-            await asyncio.sleep(2) 
+            await asyncio.sleep(2)
     except WebSocketDisconnect:
         logger.info(f"Client disconnected: {tickers}")
     except Exception as e:
