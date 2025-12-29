@@ -220,32 +220,34 @@ def search_ticker(query: str = Query(..., description="Название или �
     """Поиск с приоритетом тикеров, начинающихся на запрос"""
     try:
         q = query.strip().upper()
-        s = yf.Search(q, max_results=15)
+        # Запрашиваем больше (например, 20), чтобы после фильтрации 
+        # новостей осталось хотя бы 10-15 тикеров.
+        s = yf.Search(q, max_results=25) 
+        
         quotes = s.quotes
-        if not quotes: return {"results": []}
+        if not quotes:
+            return {"results": []}
+
+        # Логируем для отладки, сколько реально пришло тикеров от Yahoo
+        logger.info(f"Query '{q}' returned {len(quotes)} raw quotes from Yahoo")
+
+        # Сортировка: 
+        # 1. Сначала те, чей тикер начинается ровно на запрос
+        # 2. Внутри групп - по весу (score)
         sorted_quotes = sorted(
             quotes, 
-            key=lambda x: (not x.get('symbol', '').startswith(q), -x.get('score', 0))
+            key=lambda x: (
+                not x.get('symbol', '').startswith(q), 
+                -x.get('score', 0)
+            )
         )
-        return {"results": normalize_value(sorted_quotes)}
+
+        # Возвращаем максимум 15, если пришло больше
+        return {"results": normalize_value(sorted_quotes[:15])}
+        
     except Exception as e:
-        logger.error(f"Search error: {e}")
+        logger.error(f"Search error for '{query}': {e}")
         raise HTTPException(status_code=500, detail="Search failed")
-
-
-# --- ФИНАНСЫ И ОТЧЕТНОСТЬ ---
-@app.get("/financials/{ticker}", tags=["Financials"])
-def get_financials(ticker: str):
-    """Баланс, Прибыли и Кэшфлоу."""
-    try:
-        t = yf.Ticker(ticker.upper())
-        return normalize_value({
-            "income_statement": t.income_stmt,
-            "balance_sheet": t.balance_sheet,
-            "cashflow": t.cashflow
-        })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/info/{ticker}", tags=["Full Data"])
