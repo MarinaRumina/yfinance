@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import os
 from typing import Optional, Any, List, Dict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from fastapi import FastAPI, HTTPException, Query, Path, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from yfinance import AsyncWebSocket
@@ -286,17 +286,17 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     # -----------------------------------------------------------
     # 1. ИНИЦИАЛИЗАЦИЯ (Загружаем данные из кэша)
     # -----------------------------------------------------------
-    initial_data = {}
+    initial_snapshot = {}
     for sym in ticker_list:
-        full_info = get_combined_quote(sym) 
-        if full_info:
-            full_info['source'] = 'init_cache'
-            initial_data[sym] = full_info
+        data = get_combined_quote(sym)
+        if data:
+            data['source'] = 'initial_snapshot'
+            initial_snapshot[sym] = data
     
-    if initial_data:
+    if initial_snapshot:
         try:
             # Очищаем данные перед отправкой (защита от краша)
-            await websocket.send_json(clean_for_json(initial_data))
+            await websocket.send_json(clean_for_json(initial_snapshot))
         except Exception:
             return # Клиент отключился сразу
 
@@ -322,19 +322,15 @@ async def websocket_price(websocket: WebSocket, tickers: str):
             if sym and sym in BASE_DATA_CACHE:
                 cached_item = BASE_DATA_CACHE[sym]
                 
-                # --- А. ОБРАБОТКА ВРЕМЕНИ ---
+                # Обновляем время
                 raw_time = message.get('time')
                 if raw_time:
                     # Конвертируем Unix timestamp (мс) в UTC ISO
                     dt_object = datetime.fromtimestamp(raw_time / 1000, tz=timezone.utc)
-                    cached_item['date'] = dt_object.isoformat()
+                    cached_item['data_date'] = dt_object.isoformat()
                     cached_item['timestamp_raw'] = raw_time 
                 
-                # --- Б. ОБРАБОТКА СЕССИИ ---
-                market_phase = message.get('marketHours', 'REGULAR') 
-                cached_item['market_state'] = market_phase
-
-                # --- В. ЦЕНА И ОБЪЕМ ---
+                # Обновляем цену и объем
                 new_price = message.get('price')
                 if new_price:
                     cached_item['current_price'] = new_price
@@ -342,87 +338,78 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                 if message.get('dayVolume'):
                     cached_item['volume'] = message.get('dayVolume')
 
-                # --- Г. УМНОЕ ОБНОВЛЕНИЕ HIGH/LOW ---
-                # 1. Если Yahoo прислал dayHigh/dayLow - верим им.
-                # 2. Иначе обновляем сами, но ТОЛЬКО в REGULAR сессию.
+                # Умное обновление High/Low (используем ключи 'high'/'low' как в get_combined_quote)
+                market_phase = message.get('marketHours', 'REGULAR')
                 
-                # High
-                if message.get('dayHigh'):
-                    cached_item['day_high'] = message.get('dayHigh')
+                # Обновляем High
+                msg_high = message.get('dayHigh')
+                if msg_high:
+                    cached_item['high'] = msg_high
                 elif new_price and market_phase == 'REGULAR':
-                    curr_h = cached_item.get('day_high')
-                    # Сравниваем аккуратно, учитывая None
-                    if curr_h is None or clean_for_json(curr_h) is None or new_price > curr_h:
-                        cached_item['day_high'] = new_price
+                    if cached_item.get('high') is None or new_price > cached_item['high']:
+                        cached_item['high'] = new_price
                         
-                # Low
-                if message.get('dayLow'):
-                    cached_item['day_low'] = message.get('dayLow')
+                # Обновляем Low
+                msg_low = message.get('dayLow')
+                if msg_low:
+                    cached_item['low'] = msg_low
                 elif new_price and market_phase == 'REGULAR':
-                    curr_l = cached_item.get('day_low')
-                    # Сравниваем аккуратно, учитывая None
-                    if curr_l is None or clean_for_json(curr_l) is None or new_price < curr_l:
-                        cached_item['day_low'] = new_price
+                    if cached_item.get('low') is None or new_price < cached_item['low']:
+                        cached_item['low'] = new_price
 
                 # Change Percent
                 if message.get('changePercent') is not None:
                      cached_item['change_percent'] = message.get('changePercent')
                 
-                cached_item['source'] = 'REALTIME_SOCKET' 
+                
 
                 # --- ОТПРАВКА КЛИЕНТУ ---
-                try:
-                    # Чистим ВСЁ перед отправкой. Это ключевой момент фикса.
-                    payload = clean_for_json({sym: cached_item})
-                    await websocket.send_json(payload)
-                    
-                    # Даем циклу событий "выдохнуть", чтобы отправка успела пройти
-                    await asyncio.sleep(0) 
-                    
-                except (WebSocketDisconnect, ConnectionClosedError):
-                    # Клиент ушел - прерываем цикл yfinance
-                    break
-                except Exception as send_err:
-                    # Логируем ошибку отправки, но пробуем работать дальше
-                    logger.error(f"Error sending JSON to client: {send_err}")
+                # Подготовка данных для отправки конкретно этого тикера
+                # Мы оборачиваем его в структуру, которую ждет клиент: { "AAPL": {...} }
+                payload = clean_for_json({
+                    sym: {
+                        "symbol": sym,
+                        "current_price": cached_item.get('current_price'),
+                        "change_percent": round(cached_item.get('change_percent', 0), 2),
+                        "open": cached_item.get('open'),
+                        "high": cached_item.get('high'),
+                        "low": cached_item.get('low'),
+                        "volume": cached_item.get('volume'),
+                        "previous_close": cached_item.get('prev_close'),
+                        "date": cached_item.get('data_date'),
+                        "source": "REALTIME_SOCKET"
+                    }
+                })
 
-    except WebSocketDisconnect:
-        # Штатное отключение
-        pass
-        return 
+                try:
+                    await websocket.send_json(payload)
+                except (WebSocketDisconnect, ConnectionClosedError):
+                    break
+                
+                await asyncio.sleep(0.01) # Даем системе обработать очередь
         
     except Exception as e:
-        logger.warning(f"WebSocket General Error ({e}). Switching to Polling Fallback...")
-        # Падаем вниз, в Fallback
-        
-    finally:
-        # Убиваем объект подписки yfinance, чтобы остановить логи
-        if aws:
-            del aws 
-
-    # -----------------------------------------------------------
-    # 3. FALLBACK (HTTP Polling)
-    # Запускается, если живой сокет упал
-    # -----------------------------------------------------------
-    try:
+        logger.warning(f"WebSocket Socket Error: {e}. Switching to Polling Fallback...")
+        # FALLBACK: Если сокет yfinance не отдает данные (например, в выходные), 
+        # запускаем обычный опрос раз в 5 секунд.
         while True:
-            updates = {}
-            for sym in ticker_list:
-                data = get_combined_quote(sym)
-                if data:
-                    data['source'] = 'HTTP_POLLING'
-                    updates[sym] = data
+            try:
+                fallback_data = {}
+                for sym in ticker_list:
+                    d = get_combined_quote(sym)
+                    if d:
+                        d['source'] = 'polling_fallback'
+                        fallback_data[sym] = d
+                await websocket.send_json(clean_for_json(fallback_data))
+                await asyncio.sleep(5)
+            except:
+                break
+    finally:
+        if aws:
+            # Важно: AsyncWebSocket не всегда корректно закрывается через del
+            # В некоторых версиях может потребоваться aws.close() если он есть
+            pass
             
-            if updates:
-                try:
-                    await websocket.send_json(clean_for_json(updates))
-                except Exception:
-                    break # Если не смогли отправить при поллинге - выходим
-            
-            await asyncio.sleep(5) 
-
-    except Exception:
-        pass # Если сокет уже мертв, ничего не делаем
             
 
 # --- ИСТОРИЧЕСКИЕ ДАННЫЕ ---
