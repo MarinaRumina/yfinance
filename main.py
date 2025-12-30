@@ -218,28 +218,33 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     """
     **Асинхронный WebSocket для живых цен.**
     
-    Принимает список тикеров через запятую. Каждые 2 секунды отправляет обновление цен и объемов. 
+    Принимает список тикеров через запятую. 
+    Сначала пытается установить Real-time соединение с Yahoo (AsyncWebSocket).
+    Если не выходит — переключается на Fallback (опрос HTTP каждые 5 секунд).
     
-    Использует кэширование и обновляет High/Low в реальном времени.
+    Использует кэширование и обновляет High/Low в реальном времени (в часы REGULAR).
     
     URL: wss://app.domain.name.or.ip/ws/price/eslt.ta,teva.ta,dfns.l,aapl
     """
     await websocket.accept()
     ticker_list = [s.strip().upper() for s in tickers.split(",")]
     
-    # 1. ИНИЦИАЛИЗАЦИЯ (Загружаем последнее известное состояние)
+    # 1. ИНИЦИАЛИЗАЦИЯ (Загружаем последнее известное состояние из кэша)
     initial_data = {}
     for sym in ticker_list:
-        # Предполагаем, что get_combined_quote возвращает 'last_trade_time'
-        # из fast_info или info. Если нет - добавьте это в get_combined_quote.
+        # get_combined_quote должна возвращать полные данные, включая дату
         full_info = get_combined_quote(sym) 
         if full_info:
+            full_info['source'] = 'init_cache' # Метка инициализации
             initial_data[sym] = full_info
     
     if initial_data:
-        await websocket.send_json(initial_data)
+        try:
+            await websocket.send_json(initial_data)
+        except Exception:
+            return # Клиент отключился сразу после подключения, выходим
 
-    # 2. ПОДКЛЮЧЕНИЕ WEB SOCKET
+    # 2. ПОДКЛЮЧЕНИЕ ЖИВОГО WEB SOCKET (Real-time)
     try:
         aws = AsyncWebSocket()
         await aws.subscribe(ticker_list)
@@ -249,87 +254,109 @@ async def websocket_price(websocket: WebSocket, tickers: str):
             # {
             #   'id': 'AAPL', 
             #   'price': 150.05, 
-            #   'time': 1704050000000,  <-- ВРЕМЯ СДЕЛКИ (мс)
-            #   'marketHours': 'REGULAR', <-- ТИП СЕССИИ (PRE, REGULAR, POST)
+            #   'time': 1704050000000,
+            #   'marketHours': 'REGULAR',
             #   'dayVolume': 50000,
             #   ...
             # }
             
             sym = message.get('id')
-            
             if sym and sym in BASE_DATA_CACHE:
                 cached_item = BASE_DATA_CACHE[sym]
                 
                 # --- 1. ОБРАБОТКА ВРЕМЕНИ ---
                 raw_time = message.get('time')
                 if raw_time:
-                    # Конвертируем Unix timestamp (мс) в читаемый UTC ISO формат
+                    # Конвертируем Unix timestamp (мс) в читаемый UTC ISO формат.
                     # Это время БИРЖИ, а не сервера.
                     dt_object = datetime.fromtimestamp(raw_time / 1000, tz=timezone.utc)
                     cached_item['date'] = dt_object.isoformat()
-                    cached_item['timestamp_raw'] = raw_time # Полезно хранить оригинал
+                    cached_item['timestamp_raw'] = raw_time 
                 
                 # --- 2. ОБРАБОТКА СЕССИИ (PRE/POST/REGULAR) ---
-                market_phase = message.get('marketHours', 'REGULAR') # PRE, POST, REGULAR, CLOSED
+                # Если Yahoo не прислал статус, считаем REGULAR (чтобы не терять данные)
+                market_phase = message.get('marketHours', 'REGULAR') 
                 cached_item['market_state'] = market_phase
 
-                # --- 3. ЦЕНА И ОБЪЕМ ---
+                # --- 3. ЦЕНА И ОБЪЕМ (Базовое обновление) ---
                 new_price = message.get('price')
                 if new_price:
                     cached_item['current_price'] = new_price
-
-                new_vol = message.get('dayVolume')
-                if new_vol:
-                    cached_item['volume'] = new_vol
+                    # Внимание: High/Low здесь НЕ обновляем, чтобы не записать премаркет в Day High
                 
+                if message.get('dayVolume'):
+                    cached_item['volume'] = message.get('dayVolume')
+
                 # --- 4. УМНОЕ ОБНОВЛЕНИЕ HIGH/LOW ---
-                # Обычно High/Low обновляют только в основную сессию.
-                # Если на пост-маркете цена упала, это не считается Day Low.
-                if market_phase == 'REGULAR' and new_price:
-                    
-                    # Если Yahoo сама прислала dayHigh/dayLow - верим им в первую очередь
-                    if message.get('dayHigh'):
-                        cached_item['day_high'] = message.get('dayHigh')
-                    elif new_price > (cached_item.get('day_high') or -float('inf')):
-                        cached_item['day_high'] = new_price
-                        
-                    if message.get('dayLow'):
-                        cached_item['day_low'] = message.get('dayLow')
-                    elif new_price < (cached_item.get('day_low') or float('inf')):
-                        cached_item['day_low'] = new_price
+                # Логика: 
+                # 1. Если Yahoo прислал явные поля 'dayHigh'/'dayLow' — верим им (это официальные данные).
+                # 2. Если нет, обновляем сами, НО только если сейчас основная сессия (REGULAR).
+                
+                # Обновление High
+                if message.get('dayHigh'):
+                    cached_item['day_high'] = message.get('dayHigh')
+                elif new_price and market_phase == 'REGULAR':
+                    current_high = cached_item.get('day_high')
+                    # Если High еще нет (None/NaN) или новая цена выше
+                    if current_high is None or np.isnan(current_high) or new_price > current_high:
+                         cached_item['day_high'] = new_price
+                
+                # Обновление Low
+                if message.get('dayLow'):
+                    cached_item['day_low'] = message.get('dayLow')
+                elif new_price and market_phase == 'REGULAR':
+                    current_low = cached_item.get('day_low')
+                    # Если Low еще нет (None/NaN) или новая цена ниже
+                    if current_low is None or np.isnan(current_low) or new_price < current_low:
+                         cached_item['day_low'] = new_price
 
                 # Change percent
                 if message.get('changePercent') is not None:
                      cached_item['change_percent'] = message.get('changePercent')
                 
-                cached_item['source'] = 'websocket_live'
+                # !!! ГЛАВНОЕ: Метка источника !!!
+                cached_item['source'] = 'REALTIME_SOCKET' 
 
                 # Отправляем обновление клиенту
                 await websocket.send_json({sym: cached_item})
 
+    except WebSocketDisconnect:
+        logger.info("Client disconnected gracefully during WS phase.")
+        return # Просто выходим, закрывать сокет не нужно (он уже закрыт клиентом)
+        
     except Exception as e:
         logger.warning(f"WebSocket Error ({e}). Switching to Polling Fallback...")
         
         # 3. FALLBACK (HTTP Polling)
-        # Здесь тоже нужно брать время из данных, а не datetime.now()
+        # Если живой сокет упал (например, бан IP или старая версия yfinance),
+        # переходим на запасной вариант с опросом раз в 5 секунд.
         try:
             while True:
                 updates = {}
                 for sym in ticker_list:
                     data = get_combined_quote(sym)
                     if data:
-                        # В get_combined_quote убедитесь, что берете время из 
-                        # ticker.fast_info.last_trade_time или ticker.info['regularMarketTime']
+                        # get_combined_quote уже должен брать правильное время из fast_info
+                        data['source'] = 'HTTP_POLLING'
                         updates[sym] = data
-                        updates[sym]['source'] = 'http_polling'
                 
                 if updates:
                     await websocket.send_json(updates)
                 
-                await asyncio.sleep(5)
+                # Ждем 5 сек, чтобы не получить бан от Yahoo при частых HTTP запросах
+                await asyncio.sleep(5) 
+
+        except (WebSocketDisconnect, RuntimeError):
+             # Клиент отключился во время поллинга
+             logger.info("Client disconnected during polling.")
+             return # Выходим молча
         except Exception as poll_error:
-            logger.error(f"Polling failed: {poll_error}")
-            await websocket.close()
+            # А вот если упал сам сервер (ошибка кода), пишем лог и пытаемся закрыть
+            logger.error(f"Polling crashed: {poll_error}")
+            try:
+                await websocket.close(code=1011) # 1011 = Internal Error
+            except:
+                pass # Если уже закрыт, игнорируем
             
 
 # --- ИСТОРИЧЕСКИЕ ДАННЫЕ ---
