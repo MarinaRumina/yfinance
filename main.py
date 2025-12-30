@@ -155,7 +155,11 @@ def get_combined_quote(symbol: str):
 
 @app.get("/tickers/quote", tags=["Market Data"])
 def get_multiple_quotes(symbols: str = Query(...)):
-    """Получение котировок для списка тикеров с использованием кэша."""
+    """
+    Получение котировок для списка тикеров с использованием кэша.
+    Тикеры через запятую: AAPL,TSLA
+    URL: /tickers/quote?symbols=aapl,goog
+    """
     try:
         ticker_list = [s.strip().upper() for s in symbols.split(",")]
         result = {}
@@ -173,6 +177,7 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     """
     Асинхронный WebSocket для нескольких тикеров (через запятую).
     Использует кэширование и обновляет High/Low в реальном времени.
+    URL: wss://app.domain.name.or.ip/ws/price/eslt.ta,teva.ta,dfns.l,aapl
     """
     await websocket.accept()
     ticker_list = [s.strip().upper() for s in tickers.split(",")]
@@ -211,12 +216,13 @@ def get_history(ticker: str, period: str = "1mo", interval: str = "1d"):
     Исторические данные OHLC + Volume + Dividends + Splits.
     Data aggregation interval ("1h", "1d", "1wk", "1mo"). Default value : 1mo.
     Available values : 1h, 1d, 1wk, 1mo. Default value : 1d.
+    URL: /history/AAPL?period=1mo&interval=1d
     """
     t = yf.Ticker(ticker.upper())
     hist = t.history(period=period, interval=interval)
     return normalize_value(hist)
 
-@app.get("/tickers/history", tags=["Historical Data"])
+@app.get("/history/tickerslist", tags=["Historical Data"])
 def get_multiple_histories(
     symbols: str = Query(..., description="Тикеры через запятую, например: AAPL,TSLA,MSFT"), 
     period: str = "1mo", 
@@ -224,6 +230,7 @@ def get_multiple_histories(
 ):
     """
     Получение истории для нескольких тикеров сразу.
+    URL: /history/tickerlist?symbols=AAPL,MSFT.
     Возвращает словарь: { "AAPL": [свечи], "TSLA": [свечи] }
     """
     ticker_list = [s.strip().upper() for s in symbols.split(",")]
@@ -251,7 +258,10 @@ def get_multiple_histories(
 # --- УТИЛИТЫ ---
 @app.get("/search", tags=["Utility"])
 def search_ticker(query: str = Query(..., description="Название или тикер")):
-    """Поиск с приоритетом тикеров, начинающихся на запрос"""
+    """
+    Поиск с приоритетом тикеров, начинающихся на запрос.
+    URL: /search?query=aap
+    """
     try:
         q = query.strip().upper()
         # Запрашиваем больше (например, 20), чтобы после фильтрации 
@@ -286,7 +296,10 @@ def search_ticker(query: str = Query(..., description="Название или �
 
 @app.get("/info/{ticker}", tags=["Full Data"])
 def get_info(ticker: str):
-    """Полная информация о компании."""
+    """
+    Полная информация о компании.
+    URL: /info/aapl
+    """
     t = yf.Ticker(ticker.upper())
     return normalize_value(t.info)
 
@@ -306,7 +319,10 @@ def get_financials(ticker: str):
 
 @app.get("/dividends/{ticker}", tags=["Corporate Actions"])
 def get_dividends(ticker: str):
-    """История дивидендов."""
+    """
+    История дивидендов.
+    URL: /dividends/aapl
+    """
     t = yf.Ticker(ticker.upper())
     divs = t.dividends
     if divs.empty:
@@ -315,7 +331,10 @@ def get_dividends(ticker: str):
 
 @app.get("/splits/{ticker}", tags=["Corporate Actions"])
 def get_splits(ticker: str):
-    """История сплитов."""
+    """
+    История сплитов.
+    URL: /splits/aapl
+    """
     t = yf.Ticker(ticker.upper())
     splits = t.splits
     if splits.empty:
@@ -324,7 +343,10 @@ def get_splits(ticker: str):
 
 @app.get("/actions/{ticker}", tags=["Corporate Actions"])
 def get_actions(ticker: str):
-    """Все действия (дивиденды + сплиты)."""
+    """
+    Все действия (дивиденды + сплиты).
+    URL: /actions/aapl
+    """
     t = yf.Ticker(ticker.upper())
     if t.actions.empty:
         return {"symbol": ticker.upper(), "message": "No actions found", "data": []}
@@ -335,7 +357,10 @@ def get_actions(ticker: str):
 
 @app.get("/calendar/{ticker}", tags=["Information"])
 def get_calendar(ticker: str):
-    """Календарь событий (отчеты, дивиденды)."""
+    """
+    Календарь событий (отчеты, дивиденды).
+    URL: /calendar/aapl
+    """
     t = yf.Ticker(ticker.upper())
     return normalize_value(t.calendar)
 
@@ -347,7 +372,10 @@ def get_news(ticker: str):
 
 @app.get("/holders/{ticker}", tags=["Information"])
 def get_holders(ticker: str):
-    """Крупнейшие держатели акций."""
+    """
+    Крупнейшие держатели акций.
+    URL: /holders/aapl
+    """
     t = yf.Ticker(ticker.upper())
     return normalize_value({
         "major": t.major_holders,
@@ -356,7 +384,10 @@ def get_holders(ticker: str):
 
 @app.get("/recommendations/{ticker}", tags=["Information"])
 def get_recommendations(ticker: str):
-    """Рекомендации аналитиков."""
+    """
+    Рекомендации аналитиков.
+    URL: /recomendations/aapl
+    """
     t = yf.Ticker(ticker.upper())
     return normalize_value(t.recommendations)
 
