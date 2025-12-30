@@ -9,12 +9,21 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="YFinance Ultimate API", version="2.1.0")
-
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(
+    title="YFinance Ultimate API", 
+    version="2.1.1",
+    description="Professional API for Yahoo Finance data with WebSocket support, caching, and extended historical data queries."
+)
+app.add_middleware(
+    CORSMiddleware, 
+    allow_origins=["*"], 
+    allow_methods=["*"], 
+    allow_headers=["*"]
+)
 
 # --- ГЛОБАЛЬНЫЙ КЭШ ДЛЯ СТАТИЧНЫХ ДАННЫХ ДНЯ ---
 # Структура: {"AAPL": {"open": 150.0, "high": 155.0, ... "cache_date": "2025-12-29"}}
@@ -33,6 +42,7 @@ EXCHANGE_MAP = {
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def normalize_value(v: Any) -> Any:
+    """Приводит типы данных Pandas/Numpy к JSON-совместимым форматам."""
     if isinstance(v, (pd.Timestamp, datetime)): return v.isoformat()
     if isinstance(v, (np.integer, int)): return int(v)
     if isinstance(v, (np.floating, float)):
@@ -86,6 +96,7 @@ def get_ticker_base_data(symbol: str, t_obj):
         return None
 
 def get_combined_quote(symbol: str):
+    """Комбинирует статические данные из кэша и живые котировки."""
     t = yf.Ticker(symbol)
     
     # ЗАГРУЗКА БАЗОВЫХ ДАННЫХ (КЭШ)
@@ -94,14 +105,14 @@ def get_combined_quote(symbol: str):
     base = get_ticker_base_data(symbol, t)
     if not base: return None
 
-    # Попытка №1: Используем fast_info (вместо basic_info)
+    # Используем fast_info (вместо basic_info)
     f = t.fast_info
     curr = getattr(f, 'last_price', None)
     live_vol = getattr(f, 'last_volume', None)
     live_hi = getattr(f, 'day_high', None)
     live_lo = getattr(f, 'day_low', None)
 
-    # Попытка №2: Если данные застыли (рынок открыт, но fast_info не обновляется)
+    # Если данные застыли (рынок открыт, но fast_info не обновляется)
     # Сравниваем текущую цену с закрытием вчера и объем с 0
     if curr is None or curr == base['prev_close'] or live_vol == 0:
         h_live = t.history(period="1d", interval="1m")
@@ -154,10 +165,15 @@ def get_combined_quote(symbol: str):
 # --- РЫНОЧНЫЕ ДАННЫЕ ---
 
 @app.get("/tickers/quote", tags=["Market Data"])
-def get_multiple_quotes(symbols: str = Query(...)):
+def get_multiple_quotes(
+    symbols: str = Query(..., description="Список тикеров через запятую", example="AAPL,TSLA,GOOGL,ESLT.TA")
+):
     """
-    Получение котировок для списка тикеров с использованием кэша.
-    Тикеры через запятую: AAPL,TSLA
+    **Получение текущих котировок (Live Quotes).**
+    
+    Возвращает актуальную цену, процент изменения, дневные High/Low и объемы.
+    Данные кэшируются на уровне базовых показателей дня для оптимизации скорости.
+    
     URL: /tickers/quote?symbols=aapl,goog
     """
     try:
@@ -175,8 +191,12 @@ def get_multiple_quotes(symbols: str = Query(...)):
 @app.websocket("/ws/price/{tickers}")
 async def websocket_price(websocket: WebSocket, tickers: str):
     """
-    Асинхронный WebSocket для нескольких тикеров (через запятую).
+    **Асинхронный WebSocket для живых цен.**
+    
+    Принимает список тикеров через запятую. Каждые 2 секунды отправляет обновление цен и объемов. 
+    
     Использует кэширование и обновляет High/Low в реальном времени.
+    
     URL: wss://app.domain.name.or.ip/ws/price/eslt.ta,teva.ta,dfns.l,aapl
     """
     await websocket.accept()
@@ -215,35 +235,46 @@ async def websocket_price(websocket: WebSocket, tickers: str):
 def get_multiple_histories(
     symbols: str = Query(
         ..., 
-        description="Тикеры через запятую (1-20 символов каждый, буквы, цифры, точки или дефисы)", 
+        description="Ticker symbols separated by commas (1-20 alphanumeric, may include . or -)", 
         example="AAPL,TSLA,TEVA.TA"
     ), 
-    period: str = Query("1mo", description="Период (1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max)"), 
-    interval: str = Query("1d", description="Интервал свечи (1m, 5m, 1h, 1d, 1wk, 1mo)"),
-    start: Optional[str] = Query(None, description="Начальная дата (YYYY-MM-DD). Если указана, 'period' игнорируется.", example="2023-01-01"),
-    end: Optional[str] = Query(None, description="Конечная дата (YYYY-MM-DD)", example="2023-12-31")
+    period: Optional[str] = Query("1mo", description="Период данных (1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max)"), 
+    interval: str = Query("1d", description="Интервал свечи (1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo)"),
+    start: Optional[str] = Query(None, description="Start date (YYYY-MM-DD). If set, 'period' will be ignored.", example="2023-01-01"),
+    end: Optional[str] = Query(None, description="End date (YYYY-MM-DD).", example="2023-12-31")
 ):
     """
-    Получение истории (данные OHLC + Volume + Dividends + Splits) для нескольких тикеров сразу.
+    **пакетное получение исторических данных (OHLC + Volume + Dividends + Splits) для нескольких тикеров сразу.**
     
     - **symbols**: Список тикеров через запятую.
-    - **start/end**: Позволяют получить данные за конкретный промежуток. Если указан 'start', параметр 'period' игнорируется.
-    - **interval**: Интервал агрегации (от 1 минуты до 3 месяцев).
+    - **start/end**: Позволяют получить данные за конкретный промежуток времени. Если указан **start** или **end**, параметр **period** игнорируется автоматически.
+    - **interval**: Интервал агрегации (размер свечи, от 1 минуты до 3 месяцев).
+    - Возвращает словарь, где ключи — тикеры, а значения — массивы исторических записей ( { "AAPL": [свечи], "TSLA": [свечи] } ).
     
     URL: /history/tickerlist?symbols=AAPL,MSFT&start=2023-01-01
+    
+    URL: /history/tickerlist?symbols=AAPL,MSFT&start=2023-01-01&end=2023-12-31&interval=1d
 
     URL: /history/tickerlist?symbols=AAPL,MSFT&period=1mo&interval=1d
-    
-    Возвращает словарь: { "AAPL": [свечи], "TSLA": [свечи] }
     """
     ticker_list = [s.strip().upper() for s in symbols.split(",")]
     result = {}
 
+    # Логика обхода ошибки "nonsense": если есть start или end, убираем period
+    effective_period = period
+    if start or end:
+        effective_period = None
+
     for symbol in ticker_list:
         try:
             t = yf.Ticker(symbol)
-            # Если переданы даты, используем их, иначе используем period
-            hist = t.history(period=period, interval=interval, start=start, end=end)
+            # Передаем только разрешенную комбинацию параметров
+            hist = t.history(
+                period=effective_period, 
+                interval=interval, 
+                start=start, 
+                end=end
+            )
             
             if not hist.empty:
                 result[symbol] = normalize_value(hist)
@@ -266,12 +297,12 @@ def get_history(
         example="AAPL"
     ),
     period: str = Query("1mo", description="Data period (e.g., 1mo, 1y, max). Available periods: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max."),
-    interval: str = Query("1d", description="Data aggregation interval (e.g., 1h, 1d, 1wk). Available intervals: 1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo."),
+    interval: str = Query("1d", description="Data aggregation interval (candle size, e.g., 1h, 1d, 1wk). Available intervals: 1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo."),
     start: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)", example="2023-01-01"),
     end: Optional[str] = Query(None, description="End date (YYYY-MM-DD)", example="2023-12-31")
 ):
     """
-    Исторические данные OHLC + Volume + Dividends + Splits для одного тикера.
+    **Исторические данные OHLC + Volume + Dividends + Splits для одного тикера.**
     
     - **ticker**: Биржевой символ компании.
     - **start/end**: Используются для точного выбора временного диапазона.
@@ -281,9 +312,10 @@ def get_history(
     URL: /history/AAPL?start=2023-01-01
     """
     try:
+        effective_period = None if (start or end) else period
         t = yf.Ticker(ticker.upper())
         # Приоритет дат над периодом встроен в саму библиотеку yfinance
-        hist = t.history(period=period, interval=interval, start=start, end=end)
+        hist = t.history(period=effective_period, interval=interval, start=start, end=end)
         return normalize_value(hist)
     except Exception as e:
         logger.error(f"History error for {ticker}: {e}")
@@ -292,24 +324,20 @@ def get_history(
 
 # --- УТИЛИТЫ ---
 @app.get("/search", tags=["Utility"])
-def search_ticker(query: str = Query(..., description="Название или тикер")):
+def search_ticker(query: str = Query(..., description="Название компании или тикер", example="Apple")):
     """
-    Поиск с приоритетом тикеров, начинающихся на запрос.
+    **Умный поиск активов.**
+    
+    Возвращает до 15 наиболее релевантных результатов. Приоритет отдается тикерам, начинающимся на поисковый запрос.
     
     URL: /search?query=aap
     """
     try:
         q = query.strip().upper()
-        # Запрашиваем больше (например, 20), чтобы после фильтрации 
-        # новостей осталось хотя бы 10-15 тикеров.
-        s = yf.Search(q, max_results=25) 
-        
+        s = yf.Search(q, max_results=15)        
         quotes = s.quotes
         if not quotes:
             return {"results": []}
-
-        # Логируем для отладки, сколько реально пришло тикеров от Yahoo
-        logger.info(f"Query '{q}' returned {len(quotes)} raw quotes from Yahoo")
 
         # Сортировка: 
         # 1. Сначала те, чей тикер начинается ровно на запрос
@@ -333,7 +361,7 @@ def search_ticker(query: str = Query(..., description="Название или �
 @app.get("/info/{ticker}", tags=["Full Data"])
 def get_info(ticker: str):
     """
-    Полная информация о компании.
+    **Полный профиль компании.** Фундаментальные данные, описание, сектор, сотрудники и т.д.
     
     URL: /info/aapl
     """
@@ -344,6 +372,7 @@ def get_info(ticker: str):
 # --- ФИНАНСОВЫЕ ДАННЫЕ ---
 @app.get("/financials/{ticker}", tags=["Financial Data"])
 def get_financials(ticker: str):
+    """**Финансовая отчетность.** Income Statement, Balance Sheet и Cash Flow."""
     t = yf.Ticker(ticker.upper())
     return normalize_value({
         "income": t.income_stmt, 
@@ -357,28 +386,24 @@ def get_financials(ticker: str):
 @app.get("/dividends/{ticker}", tags=["Corporate Actions"])
 def get_dividends(ticker: str):
     """
-    История дивидендов.
+    **История выплаты дивидендов.**
     
     URL: /dividends/aapl
     """
     t = yf.Ticker(ticker.upper())
     divs = t.dividends
-    if divs.empty:
-        return {"symbol": ticker.upper(), "message": "No dividends found", "data": []}
-    return normalize_value(divs)
+    return normalize_value(divs) if not divs.empty else {"message": "No dividends found"}
 
 @app.get("/splits/{ticker}", tags=["Corporate Actions"])
 def get_splits(ticker: str):
     """
-    История сплитов.
+    **История сплитов акций.**
     
     URL: /splits/aapl
     """
     t = yf.Ticker(ticker.upper())
     splits = t.splits
-    if splits.empty:
-        return {"symbol": ticker.upper(), "message": "No splits found", "data": []}
-    return normalize_value(splits)
+    return normalize_value(splits) if not splits.empty else {"message": "No splits found"}
 
 @app.get("/actions/{ticker}", tags=["Corporate Actions"])
 def get_actions(ticker: str):
@@ -398,7 +423,7 @@ def get_actions(ticker: str):
 @app.get("/calendar/{ticker}", tags=["Information"])
 def get_calendar(ticker: str):
     """
-    Календарь событий (отчеты, дивиденды).
+    **Календарь корпоративных событий.** Даты отчетов и ближайших дивидендов.
     
     URL: /calendar/aapl
     """
@@ -408,7 +433,7 @@ def get_calendar(ticker: str):
 @app.get("/news/{ticker}", tags=["Information"])
 def get_news(ticker: str):
     """
-    Последние новости по тикеру.
+    **Лента последних новостей по активу.**
 
     URL: /news/aapl
     """
@@ -418,7 +443,7 @@ def get_news(ticker: str):
 @app.get("/holders/{ticker}", tags=["Information"])
 def get_holders(ticker: str):
     """
-    Крупнейшие держатели акций.
+    **Крупнейшие держатели актива.**
     
     URL: /holders/aapl
     """
@@ -431,7 +456,7 @@ def get_holders(ticker: str):
 @app.get("/recommendations/{ticker}", tags=["Information"])
 def get_recommendations(ticker: str):
     """
-    Рекомендации аналитиков.
+    **Рекомендации аналитиков по активу (byu/sell/hold/etc.).**
     
     URL: /recomendations/aapl
     """
@@ -441,7 +466,7 @@ def get_recommendations(ticker: str):
 
 @app.get("/health", tags=["Utility"])
 def health():
-    """Проверка состояния API и размера кэша."""
+    """**Проверка здоровья API.** Возвращает статус системы и текущий размер кэша."""
     return {
         "status": "online", 
         "timestamp": datetime.now().isoformat(),
