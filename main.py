@@ -3,7 +3,7 @@ import logging
 import os
 from typing import Optional, Any, List, Dict
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Path, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 import pandas as pd
@@ -213,11 +213,15 @@ async def websocket_price(websocket: WebSocket, tickers: str):
 
 @app.get("/history/tickerlist", tags=["Historical Data"])
 def get_multiple_histories(
-    symbols: str = Query(..., description="Ticker symbols separated by commas (1-20 alphanumeric, may include . or -)", example="AAPL,TSLA,MSFT"), 
-    period: str = Query("1mo", description="Data period (1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max)"), 
-    interval: str = Query("1d", description="Data aggregation interval (1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo)"),
-    start: Optional[str] = Query(None, description="Start date (YYYY-MM-DD). If set, 'period' is ignored.", example="2023-01-01"),
-    end: Optional[str] = Query(None, description="End date (YYYY-MM-DD). Default is today.", example="2023-12-31")
+    symbols: str = Query(
+        ..., 
+        description="Тикеры через запятую (1-20 символов каждый, буквы, цифры, точки или дефисы)", 
+        example="AAPL,TSLA,TEVA.TA"
+    ), 
+    period: str = Query("1mo", description="Период (1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max)"), 
+    interval: str = Query("1d", description="Интервал свечи (1m, 5m, 1h, 1d, 1wk, 1mo)"),
+    start: Optional[str] = Query(None, description="Начальная дата (YYYY-MM-DD). Если указана, 'period' игнорируется.", example="2023-01-01"),
+    end: Optional[str] = Query(None, description="Конечная дата (YYYY-MM-DD)", example="2023-12-31")
 ):
     """
     Получение истории (данные OHLC + Volume + Dividends + Splits) для нескольких тикеров сразу.
@@ -255,7 +259,12 @@ def get_multiple_histories(
 
 @app.get("/history/{ticker}", tags=["Historical Data"])
 def get_history(
-    ticker: str = Path(..., description="Ticker symbol (1-20 alphanumeric, may include . or -)", regex="^[A-Za-z0-9\\.-]{1,20}$"),
+    ticker: str = Path(
+        ..., 
+        description="Ticker symbol (1-20 alphanumeric, may include . or -)", 
+        pattern="^[A-Za-z0-9\\.-]{1,20}$", # Это ограничение на ввод
+        example="AAPL"
+    ),
     period: str = Query("1mo", description="Data period (e.g., 1mo, 1y, max). Available periods: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max."),
     interval: str = Query("1d", description="Data aggregation interval (e.g., 1h, 1d, 1wk). Available intervals: 1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo."),
     start: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)", example="2023-01-01"),
