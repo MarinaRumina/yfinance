@@ -210,18 +210,6 @@ async def websocket_price(websocket: WebSocket, tickers: str):
 
 # --- ИСТОРИЧЕСКИЕ ДАННЫЕ ---
 
-@app.get("/history/{ticker}", tags=["Historical Data"])
-def get_history(ticker: str, period: str = "1mo", interval: str = "1d"):
-    """
-    Исторические данные OHLC + Volume + Dividends + Splits.
-    Data aggregation interval ("1h", "1d", "1wk", "1mo"). Default value : 1mo.
-    Available values : 1h, 1d, 1wk, 1mo. Default value : 1d.
-    URL: /history/AAPL?period=1mo&interval=1d
-    """
-    t = yf.Ticker(ticker.upper())
-    hist = t.history(period=period, interval=interval)
-    return normalize_value(hist)
-
 @app.get("/history/tickerslist", tags=["Historical Data"])
 def get_multiple_histories(
     symbols: str = Query(..., description="Тикеры через запятую, например: AAPL,TSLA,MSFT"), 
@@ -254,6 +242,20 @@ def get_multiple_histories(
             result[symbol] = {"error": str(e)}
 
     return result
+    
+
+@app.get("/history/{ticker}", tags=["Historical Data"])
+def get_history(ticker: str, period: str = "1mo", interval: str = "1d"):
+    """
+    Исторические данные OHLC + Volume + Dividends + Splits.
+    Data aggregation interval ("1h", "1d", "1wk", "1mo"). Default value : 1mo.
+    Available values : 1h, 1d, 1wk, 1mo. Default value : 1d.
+    URL: /history/AAPL?period=1mo&interval=1d
+    """
+    t = yf.Ticker(ticker.upper())
+    hist = t.history(period=period, interval=interval)
+    return normalize_value(hist)
+
 
 # --- УТИЛИТЫ ---
 @app.get("/search", tags=["Utility"])
