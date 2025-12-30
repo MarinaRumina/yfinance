@@ -10,16 +10,14 @@ from datetime import datetime, timezone, date
 from fastapi import FastAPI, HTTPException, Query, Path, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from yfinance import AsyncWebSocket
-# Импортируем ошибки websockets для чистого перехвата
 from websockets.exceptions import ConnectionClosedError
 
 
 # --- НАСТРОЙКА ЛОГОВ ---
-# Наш логгер - INFO
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Глушим логи yfinance и websockets, чтобы они не спамили в консоль
+# Глушим лишний спам от библиотек
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("websockets").setLevel(logging.ERROR)
 
@@ -29,9 +27,10 @@ logger.info(f"🚀 YFINANCE VERSION INSTALLED: {yf.__version__}")
 
 app = FastAPI(
     title="YFinance Ultimate API", 
-    version="2.1.1",
-    description="Professional API for Yahoo Finance data with WebSocket support, caching, and extended historical data queries."
+    version="2.1.2",
+    description="Professional API for Yahoo Finance. Fixed WebSocket streaming for real-time client visibility."
 )
+
 app.add_middleware(
     CORSMiddleware, 
     allow_origins=["*"], 
@@ -55,6 +54,23 @@ EXCHANGE_MAP = {
 }
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
+def clean_for_json(obj: Any) -> Any:
+    """Глубокая очистка данных для JSON. Гарантирует отсутствие NaN и корректность типов."""
+    if obj is None: return None
+    if isinstance(obj, (float, np.float16, np.float32, np.float64)):
+        return float(obj) if not (np.isnan(obj) or np.isinf(obj)) else None
+    if isinstance(obj, (np.int8, np.int16, np.int32, np.int64, np.integer)):
+        return int(obj)
+    if isinstance(obj, dict):
+        return {k: clean_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, np.ndarray)):
+        return [clean_for_json(v) for v in obj]
+    if isinstance(obj, (pd.Timestamp, datetime, date)):
+        return obj.isoformat()
+    return obj
+
+
 def normalize_value(v: Any) -> Any:
     """Приводит типы данных Pandas/Numpy к JSON-совместимым форматам."""
     if isinstance(v, (pd.Timestamp, datetime)): return v.isoformat()
@@ -69,34 +85,20 @@ def normalize_value(v: Any) -> Any:
     return v
 
 def get_ticker_base_data(symbol: str, t_obj):
-    """Обновляет кэш (open, prev_close, avg_vol, prev_vol) раз в сутки."""
+    """Обновляет кэш базовых цен открытия/закрытия один раз в день."""
     today_str = datetime.now().strftime('%Y-%m-%d')
-    
     if symbol in BASE_DATA_CACHE and BASE_DATA_CACHE[symbol]['cache_date'] == today_str:
         return BASE_DATA_CACHE[symbol]
 
     try:
-        # Берем историю за 10 дней для расчета среднего объема и объема вчера
-        h = t_obj.history(period="10d")
+        h = t_obj.history(period="5d")
         if h.empty: return None
-
         last_row = h.iloc[-1]
         prev_row = h.iloc[-2] if len(h) > 1 else last_row
-        
-        # Средний объем (пытаемся взять из info, если нет - считаем среднее за 10 дней)
-        avg_vol = None
-        try:
-            avg_vol = t_obj.info.get('averageVolume')
-        except:
-            pass
-        if not avg_vol:
-            avg_vol = h['Volume'].mean()
         
         base_info = {
             "open": last_row['Open'],
             "prev_close": prev_row['Close'],
-            "prev_day_volume": prev_row['Volume'],
-            "average_volume": avg_vol,
             "high": last_row['High'],
             "low": last_row['Low'],
             "volume": last_row['Volume'],
@@ -106,91 +108,33 @@ def get_ticker_base_data(symbol: str, t_obj):
         BASE_DATA_CACHE[symbol] = base_info
         return base_info
     except Exception as e:
-        logger.error(f"Error caching data for {symbol}: {e}")
+        logger.error(f"Cache error for {symbol}: {e}")
         return None
 
-
 def get_combined_quote(symbol: str):
-    """Комбинирует статические данные из кэша и живые котировки."""
+    """Собирает полный объект данных (кэш + живые данные из fast_info)."""
     t = yf.Ticker(symbol)
-    
-    # ЗАГРУЗКА БАЗОВЫХ ДАННЫХ (КЭШ)
-    # Здесь лежат: open, prev_close, prev_day_volume, average_volume
-    # А также high и low, зафиксированные на начало дня.
     base = get_ticker_base_data(symbol, t)
     if not base: return None
 
-    # Используем fast_info (вместо basic_info)
     f = t.fast_info
     curr = getattr(f, 'last_price', None)
-    live_vol = getattr(f, 'last_volume', None)
-    live_hi = getattr(f, 'day_high', None)
-    live_lo = getattr(f, 'day_low', None)
     
-    # --- НОВОЕ: ПОЛУЧЕНИЕ РЕАЛЬНОГО ВРЕМЕНИ СДЕЛКИ ---
-    # last_trade_time возвращает datetime с часовым поясом биржи.
-    # Это решает проблему выходных (будет пятничная дата) и разных часовых поясов.
-    live_time = getattr(f, 'last_trade_time', None)
-
-    # Если данные застыли (рынок открыт, но fast_info не обновляется)
-    # Сравниваем текущую цену с закрытием вчера и объем с 0
-    if curr is None or curr == base['prev_close'] or live_vol == 0:
-        h_live = t.history(period="1d", interval="1m")
-        if not h_live.empty:
-            curr = h_live['Close'].iloc[-1]
-            # Объем из истории часто более точный для не-US рынков
-            live_vol = h_live['Volume'].sum() 
-            live_hi = max(live_hi or 0, h_live['High'].max())
-            live_lo = min(live_lo or 99999999, h_live['Low'].min())
-            
-            # --- НОВОЕ: ОБНОВЛЕНИЕ ВРЕМЕНИ ИЗ ИСТОРИИ ---
-            # Если мы взяли цену из истории, то и время берем оттуда же (индекс последней свечи)
-            if not h_live.index.empty:
-                live_time = h_live.index[-1]
-
-    # --- ОБНОВЛЕНИЕ КЭША В РЕАЛЬНОМ ВРЕМЕНИ (High/Low/Volume) ---
-    # Если за эту секунду мы увидели новый High, который выше того, 
-    # что в нашем кэше base — перезаписываем его в кэш.
-    if live_hi and (np.isnan(base['high']) or live_hi > base['high']): 
-        base['high'] = live_hi
-    if live_lo and (np.isnan(base['low']) or live_lo < base['low']): 
-        base['low'] = live_lo
-    
-    # Объем: Yahoo иногда присылает 0 в середине дня. 
-    # Мы берем максимальное значение (так как объем в течение дня только растет).
-    current_vol = max(live_vol or 0, base['volume'] or 0)
-    base['volume'] = current_vol # сохраняем в кэш
-    # --------------------------------------------
-
-    # 5. РАСЧЕТ ПРОЦЕНТА ИЗМЕНЕНИЯ
-    # Считаем от цены открытия (open), если она есть. Если нет — от prev_close.
+    # Расчет процента
     op = base['open']
     base_price = op if op and not np.isnan(op) else base['prev_close']
     pct = ((curr - base_price) / base_price * 100) if curr and base_price else 0
-
-    # --- ФОРМАТИРОВАНИЕ ДАТЫ ---
-    # Если удалось получить живое время сделки — используем его.
-    # Иначе оставляем дату из кэша (base['data_date']).
-    final_date_str = base['data_date']
-    if live_time:
-        try:
-            # Преобразуем datetime или Timestamp в строку ISO 8601
-            final_date_str = live_time.isoformat()
-        except Exception:
-            pass
 
     return {
         "symbol": symbol,
         "current_price": curr,
         "change_percent": round(pct, 2),
         "open": base['open'],
-        "high": base['high'],
-        "low": base['low'],
-        "volume": current_vol,
+        "high": max(getattr(f, 'day_high', 0), base['high']),
+        "low": min(getattr(f, 'day_low', 9999999), base['low']),
+        "volume": max(getattr(f, 'last_volume', 0), base['volume']),
         "previous_close": base['prev_close'],
-        "previous_day_volume": base['prev_day_volume'],
-        "average_volume": base['average_volume'],
-        "date": final_date_str, # <-- Теперь здесь точное время сделки
+        "date": datetime.now(timezone.utc).isoformat(),
         "currency": getattr(f, 'currency', 'USD'),
         "exchange": EXCHANGE_MAP.get(getattr(f, 'exchange', ''), getattr(f, 'exchange', ''))
     }
@@ -267,148 +211,103 @@ def get_multiple_quotes(
 @app.websocket("/ws/price/{tickers}")
 async def websocket_price(websocket: WebSocket, tickers: str):
     """
-    **Асинхронный WebSocket для живых цен (Production Ready).**
+    **Высокопроизводительный WebSocket для мониторинга цен.**
     
-    Принимает список тикеров через запятую.
-    
-    1. **Инициализация:** Мгновенно отправляет текущее состояние кэша.
-    2. **Real-time (Primary):** Подключается к yfinance WebSocket.
-       - Использует "всеядную" функцию очистки данных.
-       - Корректно обновляет кэш.
-       - При ошибке отправки клиенту (разрыв) мгновенно останавливается.
-    3. **Fallback (Backup):** Если Real-time не работает, переходит на HTTP polling.
+    1. **Мгновенный ответ**: Сразу после подключения шлет последние данные из API.
+    2. **Real-time**: Подключается к стриму Yahoo (только для активных рынков, чаще US).
+    3. **Polling Fallback**: Если стрим молчит, автоматически обновляет данные раз в 5 сек.
     
     URL: wss://app.domain.name.or.ip/ws/price/eslt.ta,teva.ta,dfns.l,aapl
     """
     await websocket.accept()
     ticker_list = [s.strip().upper() for s in tickers.split(",")]
-    
-    # -----------------------------------------------------------
-    # 1. ИНИЦИАЛИЗАЦИЯ (Загружаем данные из кэша)
-    # -----------------------------------------------------------
-    initial_snapshot = {}
-    for sym in ticker_list:
-        data = get_combined_quote(sym)
-        if data:
-            data['source'] = 'initial_snapshot'
-            initial_snapshot[sym] = data
-    
-    if initial_snapshot:
-        try:
-            # Очищаем данные перед отправкой (защита от краша)
-            await websocket.send_json(clean_for_json(initial_snapshot))
-        except Exception:
-            return # Клиент отключился сразу
+    logger.info(f"Connected: {tickers}")
 
-    # -----------------------------------------------------------
-    # 2. ПОДКЛЮЧЕНИЕ ЖИВОГО WEB SOCKET (Real-time)
-    # -----------------------------------------------------------
-    aws = None
+    async def send_to_client(data: dict):
+        """Вспомогательная функция для безопасной отправки JSON."""
+        try:
+            clean_data = clean_for_json(data)
+            await websocket.send_json(clean_data)
+        except (WebSocketDisconnect, ConnectionClosedError):
+            return False
+        except Exception as e:
+            logger.error(f"Send error: {e}")
+            return False
+    
+    # -------------------------------------------------------
+    # ШАГ 1: МГНОВЕННЫЙ ПУШ ПРИ ПОДКЛЮЧЕНИИ
+    # -------------------------------------------------------
+    initial_data = {}
+    for sym in ticker_list:
+        q = get_combined_quote(sym)
+        if q:
+            q['source'] = 'initial_sync'
+            initial_data[sym] = q
+    
+    if initial_data:
+        await send_to_client(initial_data)
+
+    # -------------------------------------------------------
+    # ШАГ 2: ПОТОКОВАЯ ОБРАБОТКА
+    # -------------------------------------------------------
+    aws = AsyncWebSocket()
+    
     try:
-        aws = AsyncWebSocket()
+        # Пытаемся запустить нативный вебсокет yfinance
         await aws.subscribe(ticker_list)
-        
-        # Получаем итератор сообщений
         iterator = await aws.listen()
 
-        async for message in iterator:
-            # Если сообщение пустое - пропускаем
-            if not message: 
-                continue
+        # Создаем задачу для пинга (чтобы соединение не тухло)
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(15)
+                await send_to_client({"type": "ping", "timestamp": datetime.now().isoformat()})
 
-            sym = message.get('id')
-            
-            # Обрабатываем только если тикер валидный и есть в нашем кэше
-            if sym and sym in BASE_DATA_CACHE:
-                cached_item = BASE_DATA_CACHE[sym]
-                
-                # Обновляем время
-                raw_time = message.get('time')
-                if raw_time:
-                    # Конвертируем Unix timestamp (мс) в UTC ISO
-                    dt_object = datetime.fromtimestamp(raw_time / 1000, tz=timezone.utc)
-                    cached_item['data_date'] = dt_object.isoformat()
-                    cached_item['timestamp_raw'] = raw_time 
-                
-                # Обновляем цену и объем
-                new_price = message.get('price')
-                if new_price:
-                    cached_item['current_price'] = new_price
-                
-                if message.get('dayVolume'):
-                    cached_item['volume'] = message.get('dayVolume')
+        heartbeat_task = asyncio.create_task(heartbeat())
 
-                # Умное обновление High/Low (используем ключи 'high'/'low' как в get_combined_quote)
-                market_phase = message.get('marketHours', 'REGULAR')
-                
-                # Обновляем High
-                msg_high = message.get('dayHigh')
-                if msg_high:
-                    cached_item['high'] = msg_high
-                elif new_price and market_phase == 'REGULAR':
-                    if cached_item.get('high') is None or new_price > cached_item['high']:
-                        cached_item['high'] = new_price
-                        
-                # Обновляем Low
-                msg_low = message.get('dayLow')
-                if msg_low:
-                    cached_item['low'] = msg_low
-                elif new_price and market_phase == 'REGULAR':
-                    if cached_item.get('low') is None or new_price < cached_item['low']:
-                        cached_item['low'] = new_price
-
-                # Change Percent
-                if message.get('changePercent') is not None:
-                     cached_item['change_percent'] = message.get('changePercent')
-                
-                
-
-                # --- ОТПРАВКА КЛИЕНТУ ---
-                # Подготовка данных для отправки конкретно этого тикера
-                # Мы оборачиваем его в структуру, которую ждет клиент: { "AAPL": {...} }
-                payload = clean_for_json({
-                    sym: {
-                        "symbol": sym,
-                        "current_price": cached_item.get('current_price'),
-                        "change_percent": round(cached_item.get('change_percent', 0), 2),
-                        "open": cached_item.get('open'),
-                        "high": cached_item.get('high'),
-                        "low": cached_item.get('low'),
-                        "volume": cached_item.get('volume'),
-                        "previous_close": cached_item.get('prev_close'),
-                        "date": cached_item.get('data_date'),
-                        "source": "REALTIME_SOCKET"
-                    }
-                })
-
-                try:
-                    await websocket.send_json(payload)
-                except (WebSocketDisconnect, ConnectionClosedError):
-                    break
-                
-                await asyncio.sleep(0.01) # Даем системе обработать очередь
-        
-    except Exception as e:
-        logger.warning(f"WebSocket Socket Error: {e}. Switching to Polling Fallback...")
-        # FALLBACK: Если сокет yfinance не отдает данные (например, в выходные), 
-        # запускаем обычный опрос раз в 5 секунд.
+        # Основной цикл прослушивания Yahoo WS
+        # Мы используем wait_for, чтобы если Yahoo молчит 5 секунд (рынок закрыт),
+        # мы могли переключиться на ручное обновление.
         while True:
             try:
+                # Ждем сообщение от Yahoo 5 секунд
+                message = await asyncio.wait_for(iterator.__anext__(), timeout=5.0)
+                
+                if message and message.get('id'):
+                    sym = message['id']
+                    # Формируем легкий апдейт
+                    update = {
+                        sym: {
+                            "symbol": sym,
+                            "current_price": message.get('price'),
+                            "change_percent": message.get('changePercent'),
+                            "volume": message.get('dayVolume'),
+                            "source": "yahoo_streaming",
+                            "date": datetime.now(timezone.utc).isoformat()
+                        }
+                    }
+                    if not await send_to_client(update): break
+
+            except asyncio.TimeoutError:
+                # ШАГ 3: FALLBACK (Если данных от Yahoo WS нет — например, рынок закрыт или не US)
+                # Делаем ручной запрос раз в цикл тайм-аута
                 fallback_data = {}
                 for sym in ticker_list:
-                    d = get_combined_quote(sym)
-                    if d:
-                        d['source'] = 'polling_fallback'
-                        fallback_data[sym] = d
-                await websocket.send_json(clean_for_json(fallback_data))
-                await asyncio.sleep(5)
-            except:
-                break
+                    q = get_combined_quote(sym)
+                    if q:
+                        q['source'] = 'api_polling'
+                        fallback_data[sym] = q
+                if not await send_to_client(fallback_data): break
+
+    except WebSocketDisconnect:
+        logger.info(f"Client disconnected: {tickers}")
+    except Exception as e:
+        logger.error(f"WebSocket Loop Error: {e}")
     finally:
-        if aws:
-            # Важно: AsyncWebSocket не всегда корректно закрывается через del
-            # В некоторых версиях может потребоваться aws.close() если он есть
-            pass
+        # Очистка при закрытии
+        if 'heartbeat_task' in locals():
+            heartbeat_task.cancel()
+        logger.info(f"Connection closed for {tickers}")
             
             
 
