@@ -209,17 +209,27 @@ async def websocket_price(websocket: WebSocket, tickers: str):
 
 
 # --- ИСТОРИЧЕСКИЕ ДАННЫЕ ---
-# Важно: /history/tickerslist должен находится в коде перед /history/{ticker}
+# Важно: /history/tickerlist должен находится в коде перед /history/{ticker}
 
-@app.get("/history/tickerslist", tags=["Historical Data"])
+@app.get("/history/tickerlist", tags=["Historical Data"])
 def get_multiple_histories(
-    symbols: str = Query(..., description="Тикеры через запятую, например: AAPL,TSLA,MSFT"), 
-    period: str = "1mo", 
-    interval: str = "1d"
+    symbols: str = Query(..., description="Ticker symbols separated by commas (1-20 alphanumeric, may include . or -)", example="AAPL,TSLA,MSFT"), 
+    period: str = Query("1mo", description="Data period (1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max)"), 
+    interval: str = Query("1d", description="Data aggregation interval (1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo)"),
+    start: Optional[str] = Query(None, description="Start date (YYYY-MM-DD). If set, 'period' is ignored.", example="2023-01-01"),
+    end: Optional[str] = Query(None, description="End date (YYYY-MM-DD). Default is today.", example="2023-12-31")
 ):
     """
-    Получение истории для нескольких тикеров сразу.
-    URL: /history/tickerlist?symbols=AAPL,MSFT.
+    Получение истории (данные OHLC + Volume + Dividends + Splits) для нескольких тикеров сразу.
+    
+    - **symbols**: Список тикеров через запятую.
+    - **start/end**: Позволяют получить данные за конкретный промежуток. Если указан 'start', параметр 'period' игнорируется.
+    - **interval**: Интервал агрегации (от 1 минуты до 3 месяцев).
+    
+    URL: /history/tickerlist?symbols=AAPL,MSFT&start=2023-01-01
+
+    URL: /history/tickerlist?symbols=AAPL,MSFT&period=1mo&interval=1d
+    
     Возвращает словарь: { "AAPL": [свечи], "TSLA": [свечи] }
     """
     ticker_list = [s.strip().upper() for s in symbols.split(",")]
@@ -228,15 +238,13 @@ def get_multiple_histories(
     for symbol in ticker_list:
         try:
             t = yf.Ticker(symbol)
-            # Мы используем те же параметры period и interval
-            hist = t.history(period=period, interval=interval)
+            # Если переданы даты, используем их, иначе используем period
+            hist = t.history(period=period, interval=interval, start=start, end=end)
             
             if not hist.empty:
-                # normalize_value превратит DataFrame в список словарей (records)
-                # где дата будет отдельным полем.
                 result[symbol] = normalize_value(hist)
             else:
-                result[symbol] = [] # Если данных нет, возвращаем пустой массив
+                result[symbol] = [] 
                 
         except Exception as e:
             logger.error(f"Error fetching history for {symbol}: {e}")
@@ -246,16 +254,31 @@ def get_multiple_histories(
     
 
 @app.get("/history/{ticker}", tags=["Historical Data"])
-def get_history(ticker: str, period: str = "1mo", interval: str = "1d"):
+def get_history(
+    ticker: str = Path(..., description="Ticker symbol (1-20 alphanumeric, may include . or -)", regex="^[A-Za-z0-9\\.-]{1,20}$"),
+    period: str = Query("1mo", description="Data period (e.g., 1mo, 1y, max). Available periods: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max."),
+    interval: str = Query("1d", description="Data aggregation interval (e.g., 1h, 1d, 1wk). Available intervals: 1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo."),
+    start: Optional[str] = Query(None, description="Start date (YYYY-MM-DD)", example="2023-01-01"),
+    end: Optional[str] = Query(None, description="End date (YYYY-MM-DD)", example="2023-12-31")
+):
     """
-    Исторические данные OHLC + Volume + Dividends + Splits.
-    Data aggregation interval ("1h", "1d", "1wk", "1mo"). Default value : 1mo.
-    Available values : 1h, 1d, 1wk, 1mo. Default value : 1d.
+    Исторические данные OHLC + Volume + Dividends + Splits для одного тикера.
+    
+    - **ticker**: Биржевой символ компании.
+    - **start/end**: Используются для точного выбора временного диапазона.
+    
     URL: /history/AAPL?period=1mo&interval=1d
+
+    URL: /history/AAPL?start=2023-01-01
     """
-    t = yf.Ticker(ticker.upper())
-    hist = t.history(period=period, interval=interval)
-    return normalize_value(hist)
+    try:
+        t = yf.Ticker(ticker.upper())
+        # Приоритет дат над периодом встроен в саму библиотеку yfinance
+        hist = t.history(period=period, interval=interval, start=start, end=end)
+        return normalize_value(hist)
+    except Exception as e:
+        logger.error(f"History error for {ticker}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # --- УТИЛИТЫ ---
@@ -263,6 +286,7 @@ def get_history(ticker: str, period: str = "1mo", interval: str = "1d"):
 def search_ticker(query: str = Query(..., description="Название или тикер")):
     """
     Поиск с приоритетом тикеров, начинающихся на запрос.
+    
     URL: /search?query=aap
     """
     try:
@@ -301,6 +325,7 @@ def search_ticker(query: str = Query(..., description="Название или �
 def get_info(ticker: str):
     """
     Полная информация о компании.
+    
     URL: /info/aapl
     """
     t = yf.Ticker(ticker.upper())
@@ -324,6 +349,7 @@ def get_financials(ticker: str):
 def get_dividends(ticker: str):
     """
     История дивидендов.
+    
     URL: /dividends/aapl
     """
     t = yf.Ticker(ticker.upper())
@@ -336,6 +362,7 @@ def get_dividends(ticker: str):
 def get_splits(ticker: str):
     """
     История сплитов.
+    
     URL: /splits/aapl
     """
     t = yf.Ticker(ticker.upper())
@@ -348,6 +375,7 @@ def get_splits(ticker: str):
 def get_actions(ticker: str):
     """
     Все действия (дивиденды + сплиты).
+    
     URL: /actions/aapl
     """
     t = yf.Ticker(ticker.upper())
@@ -362,6 +390,7 @@ def get_actions(ticker: str):
 def get_calendar(ticker: str):
     """
     Календарь событий (отчеты, дивиденды).
+    
     URL: /calendar/aapl
     """
     t = yf.Ticker(ticker.upper())
@@ -369,7 +398,11 @@ def get_calendar(ticker: str):
 
 @app.get("/news/{ticker}", tags=["Information"])
 def get_news(ticker: str):
-    """Последние новости по тикеру."""
+    """
+    Последние новости по тикеру.
+
+    URL: /news/aapl
+    """
     t = yf.Ticker(ticker.upper())
     return normalize_value(t.news)
 
@@ -377,6 +410,7 @@ def get_news(ticker: str):
 def get_holders(ticker: str):
     """
     Крупнейшие держатели акций.
+    
     URL: /holders/aapl
     """
     t = yf.Ticker(ticker.upper())
@@ -389,6 +423,7 @@ def get_holders(ticker: str):
 def get_recommendations(ticker: str):
     """
     Рекомендации аналитиков.
+    
     URL: /recomendations/aapl
     """
     t = yf.Ticker(ticker.upper())
