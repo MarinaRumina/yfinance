@@ -197,7 +197,8 @@ def get_combined_quote(symbol: str):
 def clean_for_json(obj: Any) -> Any:
     """
     Рекурсивно очищает данные перед отправкой в JSON.
-    Превращает NaN, Infinity и NaT в None, иначе веб-сокет разорвет соединение.
+    Превращает NaN, Infinity и NaT в None.
+    Это КРИТИЧНО для веб-сокетов: если отправить NaN, клиент разорвет соединение.
     """
     if isinstance(obj, float):
         if np.isnan(obj) or np.isinf(obj):
@@ -250,11 +251,14 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     
     Принимает список тикеров через запятую.
     
-    1. **Инициализация:** Отправляет текущее состояние кэша.
+    Алгоритм работы:
+    1. **Инициализация:** Мгновенно отправляет текущее состояние из кэша (чтобы пользователь не ждал).
     2. **Real-time (Primary):** Подключается к yfinance WebSocket (версия 1.0+).
-       - Обновляет High/Low только в REGULAR сессию.
-       - Обрабатывает PRE/POST market статусы.
-    3. **Fallback (Backup):** Если Real-time не работает, переходит на HTTP polling (раз в 5 сек).
+       - Обновляет High/Low только в REGULAR сессию (или если биржа прислала dayHigh).
+       - Обрабатывает статусы рынка (PRE/POST/REGULAR).
+       - Обновляет глобальный кэш BASE_DATA_CACHE.
+    3. **Fallback (Backup):** Если Real-time не работает (ошибка сети/библиотеки), 
+       автоматически переключается на HTTP polling (опрос раз в 5 сек).
     
     URL: wss://app.domain.name.or.ip/ws/price/eslt.ta,teva.ta,dfns.l,aapl
     """
@@ -262,21 +266,23 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     ticker_list = [s.strip().upper() for s in tickers.split(",")]
     
     # -----------------------------------------------------------
-    # 1. ИНИЦИАЛИЗАЦИЯ (Загружаем данные из кэша, чтобы не ждать первого тика)
+    # 1. ИНИЦИАЛИЗАЦИЯ (Загружаем данные из кэша)
     # -----------------------------------------------------------
     initial_data = {}
     for sym in ticker_list:
+        # get_combined_quote возвращает полные данные с датой и объемами
         full_info = get_combined_quote(sym) 
         if full_info:
-            full_info['source'] = 'init_cache'
+            full_info['source'] = 'init_cache' # Метка для отладки
             initial_data[sym] = full_info
     
     if initial_data:
         try:
-            # Обязательно чистим от NaN перед отправкой!
+            # Чистим данные от NaN перед отправкой!
             await websocket.send_json(clean_for_json(initial_data))
         except Exception:
-            return # Клиент отключился сразу
+            # Если клиент сразу отвалился - выходим
+            return 
 
     # -----------------------------------------------------------
     # 2. ПОДКЛЮЧЕНИЕ ЖИВОГО WEB SOCKET (Real-time)
@@ -290,7 +296,8 @@ async def websocket_price(websocket: WebSocket, tickers: str):
         iterator = await aws.listen()
 
         async for message in iterator:
-            # Проверка: не ушел ли клиент, пока мы ждали сообщения
+            # ПРОВЕРКА: Если клиент закрыл вкладку, немедленно прерываем цикл.
+            # Это предотвращает "зомби-логи" и попытки отправки в мертвый сокет.
             if websocket.client_state.name == "DISCONNECTED":
                 break
 
@@ -302,11 +309,13 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                 raw_time = message.get('time')
                 if raw_time:
                     # Конвертируем Unix timestamp (мс) в читаемый UTC ISO формат.
+                    # Это время БИРЖИ, а не сервера.
                     dt_object = datetime.fromtimestamp(raw_time / 1000, tz=timezone.utc)
                     cached_item['date'] = dt_object.isoformat()
                     cached_item['timestamp_raw'] = raw_time 
                 
                 # --- Б. ОБРАБОТКА СЕССИИ ---
+                # Если статус не пришел, считаем REGULAR, чтобы не ломать логику
                 market_phase = message.get('marketHours', 'REGULAR') 
                 cached_item['market_state'] = market_phase
 
@@ -319,25 +328,30 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                     cached_item['volume'] = message.get('dayVolume')
 
                 # --- Г. УМНОЕ ОБНОВЛЕНИЕ HIGH/LOW ---
-                # Логика: обновляем High/Low только если Yahoo прислал их явно,
-                # ИЛИ если мы в основной сессии (REGULAR).
+                # Логика: обновляем High/Low только если:
+                # 1. Yahoo прислал их явно (dayHigh/dayLow).
+                # 2. ИЛИ мы в основной сессии (REGULAR) и цена пробила экстремум.
+                # Это нужно, чтобы скачки на премаркете не портили дневную статистику.
                 
                 # High
                 if message.get('dayHigh'):
                     cached_item['day_high'] = message.get('dayHigh')
                 elif new_price and market_phase == 'REGULAR':
-                    current_high = cached_item.get('day_high')
-                    if current_high is None or np.isnan(current_high) or new_price > current_high:
-                         cached_item['day_high'] = new_price
-                
+                    curr_h = cached_item.get('day_high')
+                    # Проверка на None/NaN и сравнение
+                    if curr_h is None or (isinstance(curr_h, float) and np.isnan(curr_h)) or new_price > curr_h:
+                        cached_item['day_high'] = new_price
+                        
                 # Low
                 if message.get('dayLow'):
                     cached_item['day_low'] = message.get('dayLow')
                 elif new_price and market_phase == 'REGULAR':
-                    current_low = cached_item.get('day_low')
-                    if current_low is None or np.isnan(current_low) or new_price < current_low:
-                         cached_item['day_low'] = new_price
+                    curr_l = cached_item.get('day_low')
+                    # Проверка на None/NaN и сравнение
+                    if curr_l is None or (isinstance(curr_l, float) and np.isnan(curr_l)) or new_price < curr_l:
+                        cached_item['day_low'] = new_price
 
+                # Процент изменения
                 if message.get('changePercent') is not None:
                      cached_item['change_percent'] = message.get('changePercent')
                 
@@ -348,22 +362,29 @@ async def websocket_price(websocket: WebSocket, tickers: str):
 
     except WebSocketDisconnect:
         logger.info("Client disconnected gracefully during WS phase.")
-        return # Выход, fallback не нужен
+        return # Выходим, fallback не нужен
         
     except Exception as e:
         logger.warning(f"WebSocket Error ({e}). Switching to Polling Fallback...")
+        # Здесь мы не выходим, а позволяем коду упасть ниже -> в блок Fallback
         
     finally:
-        # ВАЖНО: Уничтожаем объект подписки, чтобы остановить поток логов
+        # ВАЖНО: Уничтожаем объект подписки.
+        # Это отправляет сигнал библиотеке остановить фоновый поток прослушки.
         if aws:
             del aws 
 
     # -----------------------------------------------------------
     # 3. FALLBACK (HTTP Polling)
     # Запускается только если Real-time блок упал с ошибкой (не дисконнект)
+    # Использует вашу оригинальную логику опроса через get_combined_quote
     # -----------------------------------------------------------
     try:
         while True:
+            # Проверка дисконнекта перед тяжелым запросом
+            if websocket.client_state.name == "DISCONNECTED":
+                break
+
             updates = {}
             for sym in ticker_list:
                 data = get_combined_quote(sym)
@@ -375,7 +396,7 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                 # Также чистим перед отправкой
                 await websocket.send_json(clean_for_json(updates))
             
-            # Ждем 5 сек, чтобы не получить бан
+            # Ждем 5 сек, чтобы не получить бан от Yahoo (Rate Limiting)
             await asyncio.sleep(5) 
 
     except (WebSocketDisconnect, RuntimeError, ConnectionClosedError):
@@ -383,8 +404,9 @@ async def websocket_price(websocket: WebSocket, tickers: str):
             return # Выходим молча
             
     except Exception as poll_error:
+        # Если упал сам поллинг (ошибка кода или парсинга)
         logger.error(f"Polling crashed: {poll_error}")
-        # Пытаемся закрыть сокет кодом ошибки
+        # Пытаемся закрыть сокет кодом ошибки, чтобы фронтенд знал о проблеме
         try:
             await websocket.close(code=1011)
         except:
