@@ -209,6 +209,7 @@ async def websocket_price(websocket: WebSocket, tickers: str):
 
 
 # --- ИСТОРИЧЕСКИЕ ДАННЫЕ ---
+# Важно: /history/tickerslist должен находится в коде перед /history/{ticker}
 
 @app.get("/history/tickerslist", tags=["Historical Data"])
 def get_multiple_histories(
