@@ -2,9 +2,10 @@ import asyncio
 import logging
 import os
 from typing import Optional, Any, List, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Query, Path, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from yfinance import AsyncWebSocket
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -95,6 +96,7 @@ def get_ticker_base_data(symbol: str, t_obj):
         logger.error(f"Error caching data for {symbol}: {e}")
         return None
 
+
 def get_combined_quote(symbol: str):
     """Комбинирует статические данные из кэша и живые котировки."""
     t = yf.Ticker(symbol)
@@ -111,6 +113,11 @@ def get_combined_quote(symbol: str):
     live_vol = getattr(f, 'last_volume', None)
     live_hi = getattr(f, 'day_high', None)
     live_lo = getattr(f, 'day_low', None)
+    
+    # --- НОВОЕ: ПОЛУЧЕНИЕ РЕАЛЬНОГО ВРЕМЕНИ СДЕЛКИ ---
+    # last_trade_time возвращает datetime с часовым поясом биржи.
+    # Это решает проблему выходных (будет пятничная дата) и разных часовых поясов.
+    live_time = getattr(f, 'last_trade_time', None)
 
     # Если данные застыли (рынок открыт, но fast_info не обновляется)
     # Сравниваем текущую цену с закрытием вчера и объем с 0
@@ -122,6 +129,11 @@ def get_combined_quote(symbol: str):
             live_vol = h_live['Volume'].sum() 
             live_hi = max(live_hi or 0, h_live['High'].max())
             live_lo = min(live_lo or 99999999, h_live['Low'].min())
+            
+            # --- НОВОЕ: ОБНОВЛЕНИЕ ВРЕМЕНИ ИЗ ИСТОРИИ ---
+            # Если мы взяли цену из истории, то и время берем оттуда же (индекс последней свечи)
+            if not h_live.index.empty:
+                live_time = h_live.index[-1]
 
     # --- ОБНОВЛЕНИЕ КЭША В РЕАЛЬНОМ ВРЕМЕНИ (High/Low/Volume) ---
     # Если за эту секунду мы увидели новый High, который выше того, 
@@ -143,6 +155,17 @@ def get_combined_quote(symbol: str):
     base_price = op if op and not np.isnan(op) else base['prev_close']
     pct = ((curr - base_price) / base_price * 100) if curr and base_price else 0
 
+    # --- ФОРМАТИРОВАНИЕ ДАТЫ ---
+    # Если удалось получить живое время сделки — используем его.
+    # Иначе оставляем дату из кэша (base['data_date']).
+    final_date_str = base['data_date']
+    if live_time:
+        try:
+            # Преобразуем datetime или Timestamp в строку ISO 8601
+            final_date_str = live_time.isoformat()
+        except Exception:
+            pass
+
     return {
         "symbol": symbol,
         "current_price": curr,
@@ -154,7 +177,7 @@ def get_combined_quote(symbol: str):
         "previous_close": base['prev_close'],
         "previous_day_volume": base['prev_day_volume'],
         "average_volume": base['average_volume'],
-        "date": base['data_date'],
+        "date": final_date_str, # <-- Теперь здесь точное время сделки
         "currency": getattr(f, 'currency', 'USD'),
         "exchange": EXCHANGE_MAP.get(getattr(f, 'exchange', ''), getattr(f, 'exchange', ''))
     }
@@ -188,6 +211,8 @@ def get_multiple_quotes(
         logger.error(f"Quote error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
 @app.websocket("/ws/price/{tickers}")
 async def websocket_price(websocket: WebSocket, tickers: str):
     """
@@ -201,32 +226,111 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     """
     await websocket.accept()
     ticker_list = [s.strip().upper() for s in tickers.split(",")]
-    try:
-        while True:
-            updates = {}
-            for sym in ticker_list:
-                data = get_combined_quote(sym)
-                if data:
-                    updates[sym] = {
-                        "price": normalize_value(data['current_price']),
-                        "change_percent": normalize_value(data['change_percent']),
-                        "open": normalize_value(data['open']),
-                        "high": normalize_value(data['high']),
-                        "low": normalize_value(data['low']),
-                        "volume": normalize_value(data['volume']),
-                        "previous_day_volume": normalize_value(data['previous_day_volume']),
-                        "average_volume": normalize_value(data['average_volume']),
-                        "date": data['date'],
-                        "time": datetime.now().isoformat()
-                    }
-            await websocket.send_json(updates)
-            await asyncio.sleep(2) 
-    except WebSocketDisconnect:
-        logger.info(f"WS Disconnected: {tickers}")
-    except Exception as e:
-        logger.error(f"WS error: {e}")
-        await websocket.close()
+    
+    # 1. ИНИЦИАЛИЗАЦИЯ (Загружаем последнее известное состояние)
+    initial_data = {}
+    for sym in ticker_list:
+        # Предполагаем, что get_combined_quote возвращает 'last_trade_time'
+        # из fast_info или info. Если нет - добавьте это в get_combined_quote.
+        full_info = get_combined_quote(sym) 
+        if full_info:
+            initial_data[sym] = full_info
+    
+    if initial_data:
+        await websocket.send_json(initial_data)
 
+    # 2. ПОДКЛЮЧЕНИЕ WEB SOCKET
+    try:
+        aws = AsyncWebSocket()
+        await aws.subscribe(ticker_list)
+        
+        async for message in aws:
+            # message example:
+            # {
+            #   'id': 'AAPL', 
+            #   'price': 150.05, 
+            #   'time': 1704050000000,  <-- ВРЕМЯ СДЕЛКИ (мс)
+            #   'marketHours': 'REGULAR', <-- ТИП СЕССИИ (PRE, REGULAR, POST)
+            #   'dayVolume': 50000,
+            #   ...
+            # }
+            
+            sym = message.get('id')
+            
+            if sym and sym in BASE_DATA_CACHE:
+                cached_item = BASE_DATA_CACHE[sym]
+                
+                # --- 1. ОБРАБОТКА ВРЕМЕНИ ---
+                raw_time = message.get('time')
+                if raw_time:
+                    # Конвертируем Unix timestamp (мс) в читаемый UTC ISO формат
+                    # Это время БИРЖИ, а не сервера.
+                    dt_object = datetime.fromtimestamp(raw_time / 1000, tz=timezone.utc)
+                    cached_item['date'] = dt_object.isoformat()
+                    cached_item['timestamp_raw'] = raw_time # Полезно хранить оригинал
+                
+                # --- 2. ОБРАБОТКА СЕССИИ (PRE/POST/REGULAR) ---
+                market_phase = message.get('marketHours', 'REGULAR') # PRE, POST, REGULAR, CLOSED
+                cached_item['market_state'] = market_phase
+
+                # --- 3. ЦЕНА И ОБЪЕМ ---
+                new_price = message.get('price')
+                if new_price:
+                    cached_item['current_price'] = new_price
+
+                new_vol = message.get('dayVolume')
+                if new_vol:
+                    cached_item['volume'] = new_vol
+                
+                # --- 4. УМНОЕ ОБНОВЛЕНИЕ HIGH/LOW ---
+                # Обычно High/Low обновляют только в основную сессию.
+                # Если на пост-маркете цена упала, это не считается Day Low.
+                if market_phase == 'REGULAR' and new_price:
+                    
+                    # Если Yahoo сама прислала dayHigh/dayLow - верим им в первую очередь
+                    if message.get('dayHigh'):
+                        cached_item['day_high'] = message.get('dayHigh')
+                    elif new_price > (cached_item.get('day_high') or -float('inf')):
+                        cached_item['day_high'] = new_price
+                        
+                    if message.get('dayLow'):
+                        cached_item['day_low'] = message.get('dayLow')
+                    elif new_price < (cached_item.get('day_low') or float('inf')):
+                        cached_item['day_low'] = new_price
+
+                # Change percent
+                if message.get('changePercent') is not None:
+                     cached_item['change_percent'] = message.get('changePercent')
+                
+                cached_item['source'] = 'websocket_live'
+
+                # Отправляем обновление клиенту
+                await websocket.send_json({sym: cached_item})
+
+    except Exception as e:
+        logger.warning(f"WebSocket Error ({e}). Switching to Polling Fallback...")
+        
+        # 3. FALLBACK (HTTP Polling)
+        # Здесь тоже нужно брать время из данных, а не datetime.now()
+        try:
+            while True:
+                updates = {}
+                for sym in ticker_list:
+                    data = get_combined_quote(sym)
+                    if data:
+                        # В get_combined_quote убедитесь, что берете время из 
+                        # ticker.fast_info.last_trade_time или ticker.info['regularMarketTime']
+                        updates[sym] = data
+                        updates[sym]['source'] = 'http_polling'
+                
+                if updates:
+                    await websocket.send_json(updates)
+                
+                await asyncio.sleep(5)
+        except Exception as poll_error:
+            logger.error(f"Polling failed: {poll_error}")
+            await websocket.close()
+            
 
 # --- ИСТОРИЧЕСКИЕ ДАННЫЕ ---
 # Важно: /history/tickerlist должен находится в коде перед /history/{ticker}
