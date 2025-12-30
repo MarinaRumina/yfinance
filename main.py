@@ -17,6 +17,14 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ПРОВЕРКА ВЕРСИИ ПРИ ЗАПУСКЕ
+logger.info(f"🚀 YFINANCE VERSION INSTALLED: {yf.__version__}")
+if not hasattr(yf.AsyncWebSocket, '__aiter__'):
+    logger.error("❌ This version of yfinance is TOO OLD for real-time sockets!")
+else:
+    logger.info("✅ yfinance is up to date and supports async iteration.")
+    
+
 app = FastAPI(
     title="YFinance Ultimate API", 
     version="2.1.1",
