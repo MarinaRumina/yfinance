@@ -249,7 +249,8 @@ async def websocket_price(websocket: WebSocket, tickers: str):
         aws = AsyncWebSocket()
         await aws.subscribe(ticker_list)
         
-        async for message in aws:
+        # Вызываем метод .listen(), чтобы получить генератор сообщений
+        async for message in aws.listen():
             # message example:
             # {
             #   'id': 'AAPL', 
@@ -375,7 +376,7 @@ def get_multiple_histories(
     end: Optional[str] = Query(None, description="End date (YYYY-MM-DD).", example="2023-12-31")
 ):
     """
-    **пакетное получение исторических данных (OHLC + Volume + Dividends + Splits) для нескольких тикеров сразу.**
+    **Пакетное получение исторических данных (OHLC + Volume + Dividends + Splits) для нескольких тикеров сразу.**
     
     - **symbols**: Список тикеров через запятую.
     - **start/end**: Позволяют получить данные за конкретный промежуток времени. Если указан **start** или **end**, параметр **period** игнорируется автоматически.
