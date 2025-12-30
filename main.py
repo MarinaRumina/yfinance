@@ -13,9 +13,13 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
-# Настройка логирования
+# --- НАСТРОЙКА ЛОГОВ ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ВАЖНО: Отключаем информационный шум от самой библиотеки yfinance, 
+# чтобы она не спамила в консоль каждым полученным пакетом.
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 # ПРОВЕРКА ВЕРСИИ ПРИ ЗАПУСКЕ
 logger.info(f"🚀 YFINANCE VERSION INSTALLED: {yf.__version__}")
@@ -189,6 +193,23 @@ def get_combined_quote(symbol: str):
         "exchange": EXCHANGE_MAP.get(getattr(f, 'exchange', ''), getattr(f, 'exchange', ''))
     }
 
+# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ (Решает проблему пустого экрана в клиенте при запуске websocket) ---
+def clean_for_json(obj: Any) -> Any:
+    """
+    Рекурсивно очищает данные перед отправкой в JSON.
+    Превращает NaN, Infinity и NaT в None, иначе веб-сокет разорвет соединение.
+    """
+    if isinstance(obj, float):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: clean_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [clean_for_json(v) for v in obj]
+    return obj
+
+
 
 # --- ENDPOINTS ---
 
@@ -220,23 +241,29 @@ def get_multiple_quotes(
 
 
 
+# --- ОСНОВНОЙ ВЕБ-СОКЕТ ---
+
 @app.websocket("/ws/price/{tickers}")
 async def websocket_price(websocket: WebSocket, tickers: str):
     """
     **Асинхронный WebSocket для живых цен.**
     
-    Принимает список тикеров через запятую. 
-    Сначала пытается установить Real-time соединение с Yahoo (AsyncWebSocket).
-    Если версия библиотеки старая или соединение не удается — переключается на Fallback (http-polling опрос каждые 5 секунд).
+    Принимает список тикеров через запятую.
     
-    Использует кэширование и обновляет High/Low в реальном времени (в часы REGULAR).
+    1. **Инициализация:** Отправляет текущее состояние кэша.
+    2. **Real-time (Primary):** Подключается к yfinance WebSocket (версия 1.0+).
+       - Обновляет High/Low только в REGULAR сессию.
+       - Обрабатывает PRE/POST market статусы.
+    3. **Fallback (Backup):** Если Real-time не работает, переходит на HTTP polling (раз в 5 сек).
     
     URL: wss://app.domain.name.or.ip/ws/price/eslt.ta,teva.ta,dfns.l,aapl
     """
     await websocket.accept()
     ticker_list = [s.strip().upper() for s in tickers.split(",")]
     
-    # 1. ИНИЦИАЛИЗАЦИЯ (Загружаем последнее известное состояние из кэша)
+    # -----------------------------------------------------------
+    # 1. ИНИЦИАЛИЗАЦИЯ (Загружаем данные из кэша, чтобы не ждать первого тика)
+    # -----------------------------------------------------------
     initial_data = {}
     for sym in ticker_list:
         full_info = get_combined_quote(sym) 
@@ -246,35 +273,32 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     
     if initial_data:
         try:
-            await websocket.send_json(initial_data)
+            # Обязательно чистим от NaN перед отправкой!
+            await websocket.send_json(clean_for_json(initial_data))
         except Exception:
-            return # Клиент отключился сразу после подключения
+            return # Клиент отключился сразу
 
+    # -----------------------------------------------------------
     # 2. ПОДКЛЮЧЕНИЕ ЖИВОГО WEB SOCKET (Real-time)
+    # -----------------------------------------------------------
     aws = None
     try:
         aws = AsyncWebSocket()
         await aws.subscribe(ticker_list)
+        
+        # Получаем итератор сообщений (для yfinance v1.0 это асинхронный вызов)
+        iterator = await aws.listen()
 
-        # --- МАГИЯ ДЛЯ ВЕРСИИ 1.0 ---
-        # 1. Мы убрали проверку hasattr, так как она ложно блокировала версию 1.0
-        # 2. Мы добавляем 'await' перед aws.listen(), так как в 1.0 это корутина
-
-        iterator = None
-        try:
-            # Сначала пробуем метод для новой версии 1.0
-            iterator = await aws.listen()
-        except TypeError:
-            # Если вдруг версия старая и listen() не корутина, используем сам объект
-            iterator = aws
-            
         async for message in iterator:
-            
+            # Проверка: не ушел ли клиент, пока мы ждали сообщения
+            if websocket.client_state.name == "DISCONNECTED":
+                break
+
             sym = message.get('id')
             if sym and sym in BASE_DATA_CACHE:
                 cached_item = BASE_DATA_CACHE[sym]
                 
-                # --- 1. ОБРАБОТКА ВРЕМЕНИ ---
+                # --- А. ОБРАБОТКА ВРЕМЕНИ ---
                 raw_time = message.get('time')
                 if raw_time:
                     # Конвертируем Unix timestamp (мс) в читаемый UTC ISO формат.
@@ -282,21 +306,23 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                     cached_item['date'] = dt_object.isoformat()
                     cached_item['timestamp_raw'] = raw_time 
                 
-                # --- 2. ОБРАБОТКА СЕССИИ (PRE/POST/REGULAR) ---
+                # --- Б. ОБРАБОТКА СЕССИИ ---
                 market_phase = message.get('marketHours', 'REGULAR') 
                 cached_item['market_state'] = market_phase
 
-                # --- 3. ЦЕНА И ОБЪЕМ (Базовое обновление) ---
+                # --- В. ЦЕНА И ОБЪЕМ ---
                 new_price = message.get('price')
                 if new_price:
                     cached_item['current_price'] = new_price
-                    # High/Low здесь НЕ обновляем
                 
                 if message.get('dayVolume'):
                     cached_item['volume'] = message.get('dayVolume')
 
-                # --- 4. УМНОЕ ОБНОВЛЕНИЕ HIGH/LOW ---
-                # Обновление High
+                # --- Г. УМНОЕ ОБНОВЛЕНИЕ HIGH/LOW ---
+                # Логика: обновляем High/Low только если Yahoo прислал их явно,
+                # ИЛИ если мы в основной сессии (REGULAR).
+                
+                # High
                 if message.get('dayHigh'):
                     cached_item['day_high'] = message.get('dayHigh')
                 elif new_price and market_phase == 'REGULAR':
@@ -304,7 +330,7 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                     if current_high is None or np.isnan(current_high) or new_price > current_high:
                          cached_item['day_high'] = new_price
                 
-                # Обновление Low
+                # Low
                 if message.get('dayLow'):
                     cached_item['day_low'] = message.get('dayLow')
                 elif new_price and market_phase == 'REGULAR':
@@ -312,36 +338,30 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                     if current_low is None or np.isnan(current_low) or new_price < current_low:
                          cached_item['day_low'] = new_price
 
-                # Change percent
                 if message.get('changePercent') is not None:
                      cached_item['change_percent'] = message.get('changePercent')
                 
-                # !!! Метка источника !!!
                 cached_item['source'] = 'REALTIME_SOCKET' 
 
-                await websocket.send_json({sym: cached_item})
+                # ОТПРАВКА КЛИЕНТУ (С ОЧИСТКОЙ ОТ NaN)
+                await websocket.send_json(clean_for_json({sym: cached_item}))
 
     except WebSocketDisconnect:
-        # Клиент отключился сам — это нормально
         logger.info("Client disconnected gracefully during WS phase.")
-        return 
-        
-    except (ImportError, TypeError, AttributeError) as compat_err:
-        # Ошибки старой версии библиотеки
-        logger.warning(f"YFinance compatibility issue ({compat_err}). Switching to Polling Fallback.")
-        # Переходим к блоку Fallback ниже
+        return # Выход, fallback не нужен
         
     except Exception as e:
-        # Любые другие ошибки соединения
-        logger.warning(f"WS Failed ({type(e).__name__}: {e}). Switching to Polling.")
+        logger.warning(f"WebSocket Error ({e}). Switching to Polling Fallback...")
         
     finally:
-        # ОЧЕНЬ ВАЖНО: Уничтожаем объект aws, чтобы не было ошибки Heartbeat 1011
+        # ВАЖНО: Уничтожаем объект подписки, чтобы остановить поток логов
         if aws:
             del aws 
 
+    # -----------------------------------------------------------
     # 3. FALLBACK (HTTP Polling)
-    # Этот блок запустится, если Real-time блок завершился с ошибкой (но не дисконнектом клиента)
+    # Запускается только если Real-time блок упал с ошибкой (не дисконнект)
+    # -----------------------------------------------------------
     try:
         while True:
             updates = {}
@@ -352,21 +372,20 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                     updates[sym] = data
             
             if updates:
-                await websocket.send_json(updates)
+                # Также чистим перед отправкой
+                await websocket.send_json(clean_for_json(updates))
             
-            # Ждем 5 сек
+            # Ждем 5 сек, чтобы не получить бан
             await asyncio.sleep(5) 
 
     except (WebSocketDisconnect, RuntimeError, ConnectionClosedError):
-            # Это нормальная ситуация: клиент закрыл вкладку или отключился
             logger.info("Client disconnected during polling.")
-            return # Просто выходим из функции
+            return # Выходим молча
             
     except Exception as poll_error:
-        # А вот это уже плохо: ошибка в коде или API Yahoo
         logger.error(f"Polling crashed: {poll_error}")
+        # Пытаемся закрыть сокет кодом ошибки
         try:
-            # Сообщаем клиенту, что сервер упал (код 1011)
             await websocket.close(code=1011)
         except:
             pass # Если сокет уже мертв, ничего не делаем
