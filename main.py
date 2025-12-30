@@ -19,11 +19,7 @@ logger = logging.getLogger(__name__)
 
 # ПРОВЕРКА ВЕРСИИ ПРИ ЗАПУСКЕ
 logger.info(f"🚀 YFINANCE VERSION INSTALLED: {yf.__version__}")
-if not hasattr(yf.AsyncWebSocket, '__aiter__'):
-    logger.error("❌ This version of yfinance is TOO OLD for real-time sockets!")
-else:
-    logger.info("✅ yfinance is up to date and supports async iteration.")
-    
+
 
 app = FastAPI(
     title="YFinance Ultimate API", 
@@ -245,7 +241,7 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     for sym in ticker_list:
         full_info = get_combined_quote(sym) 
         if full_info:
-            full_info['source'] = 'init_cache' # Метка инициализации
+            full_info['source'] = 'init_cache'
             initial_data[sym] = full_info
     
     if initial_data:
@@ -257,17 +253,22 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     # 2. ПОДКЛЮЧЕНИЕ ЖИВОГО WEB SOCKET (Real-time)
     aws = None
     try:
-        # Проверка совместимости версии yfinance ПЕРЕД запуском
-        # Если в AsyncWebSocket нет метода __aiter__, значит библиотека старая.
-        # Мы сразу вызываем ошибку, чтобы уйти в Fallback, не ломая выполнение.
-        if not hasattr(AsyncWebSocket, '__aiter__'):
-            raise ImportError("Installed yfinance version usually does not support 'async for'. Update to >=0.2.50")
-
         aws = AsyncWebSocket()
         await aws.subscribe(ticker_list)
-        
-        # Используем стандартный итератор (для версий 0.2.50+)
-        async for message in aws:
+
+        # --- МАГИЯ ДЛЯ ВЕРСИИ 1.0 ---
+        # 1. Мы убрали проверку hasattr, так как она ложно блокировала версию 1.0
+        # 2. Мы добавляем 'await' перед aws.listen(), так как в 1.0 это корутина
+
+        iterator = None
+        try:
+            # Сначала пробуем метод для новой версии 1.0
+            iterator = await aws.listen()
+        except TypeError:
+            # Если вдруг версия старая и listen() не корутина, используем сам объект
+            iterator = aws
+            
+        async for message in iterator:
             
             sym = message.get('id')
             if sym and sym in BASE_DATA_CACHE:
@@ -332,7 +333,7 @@ async def websocket_price(websocket: WebSocket, tickers: str):
         
     except Exception as e:
         # Любые другие ошибки соединения
-        logger.warning(f"WebSocket Error ({e}). Switching to Polling Fallback...")
+        logger.warning(f"WS Failed ({type(e).__name__}: {e}). Switching to Polling.")
         
     finally:
         # ОЧЕНЬ ВАЖНО: Уничтожаем объект aws, чтобы не было ошибки Heartbeat 1011
@@ -357,15 +358,18 @@ async def websocket_price(websocket: WebSocket, tickers: str):
             await asyncio.sleep(5) 
 
     except (WebSocketDisconnect, RuntimeError, ConnectionClosedError):
+            # Это нормальная ситуация: клиент закрыл вкладку или отключился
             logger.info("Client disconnected during polling.")
-            return # Выходим молча
+            return # Просто выходим из функции
+            
     except Exception as poll_error:
+        # А вот это уже плохо: ошибка в коде или API Yahoo
         logger.error(f"Polling crashed: {poll_error}")
-        # Пытаемся закрыть сокет, если он еще жив (код 1011 = Internal Error)
         try:
+            # Сообщаем клиенту, что сервер упал (код 1011)
             await websocket.close(code=1011)
         except:
-            pass # Если уже закрыт, игнорируем
+            pass # Если сокет уже мертв, ничего не делаем
             
 
 # --- ИСТОРИЧЕСКИЕ ДАННЫЕ ---
