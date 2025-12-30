@@ -1,6 +1,9 @@
 import asyncio
 import json
 import logging
+import yfinance as yf
+import pandas as pd
+import numpy as np
 import os
 from typing import Optional, Any, List, Dict
 from datetime import datetime, timezone
@@ -9,18 +12,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from yfinance import AsyncWebSocket
 # Импортируем ошибки websockets для чистого перехвата
 from websockets.exceptions import ConnectionClosedError
-import yfinance as yf
-import pandas as pd
-import numpy as np
+
 
 # --- НАСТРОЙКА ЛОГОВ ---
-# Насильно глушим логи yfinance, чтобы они не засоряли консоль сырыми данными
-logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-logging.getLogger("websockets").setLevel(logging.ERROR)
-
-# Наш логгер
+# Наш логгер - INFO
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Глушим логи yfinance и websockets, чтобы они не спамили в консоль
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("websockets").setLevel(logging.ERROR)
 
 # ПРОВЕРКА ВЕРСИИ ПРИ ЗАПУСКЕ
 logger.info(f"🚀 YFINANCE VERSION INSTALLED: {yf.__version__}")
@@ -197,18 +198,36 @@ def get_combined_quote(symbol: str):
 # --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ (Решает проблему пустого экрана в клиенте при запуске websocket) ---
 def clean_for_json(obj: Any) -> Any:
     """
-    Рекурсивно очищает данные перед отправкой в JSON.
-    Превращает NaN, Infinity и NaT в None.
-    БЕЗ ЭТОГО КЛИЕНТ БУДЕТ МОЛЧАТЬ, так как JSON с NaN невалиден.
+    Подготавливает любые данные к отправке через JSON.
+    FastAPI не умеет сам сериализовать numpy-числа, NaN, Timestamp и т.д.
+    Если отправить такой мусор - сокет молча упадет.
     """
-    if isinstance(obj, float):
+    # 1. Обработка пустоты и NaN
+    if obj is None:
+        return None
+    
+    # 2. Обработка чисел (Float / Numpy Float)
+    if isinstance(obj, (float, np.float16, np.float32, np.float64)):
         if np.isnan(obj) or np.isinf(obj):
             return None
-        return obj
+        return float(obj)
+    
+    # 3. Обработка целых чисел (Numpy Int)
+    if isinstance(obj, (np.int8, np.int16, np.int32, np.int64, np.integer)):
+        return int(obj)
+        
+    # 4. Обработка словарей (рекурсия)
     if isinstance(obj, dict):
         return {k: clean_for_json(v) for k, v in obj.items()}
-    if isinstance(obj, list):
+    
+    # 5. Обработка списков (рекурсия)
+    if isinstance(obj, (list, tuple, np.ndarray)):
         return [clean_for_json(v) for v in obj]
+        
+    # 6. Обработка Времени (Pandas Timestamp / Datetime / Date)
+    if isinstance(obj, (pd.Timestamp, datetime, date)):
+        return obj.isoformat()
+        
     return obj
 
 
@@ -248,15 +267,15 @@ def get_multiple_quotes(
 @app.websocket("/ws/price/{tickers}")
 async def websocket_price(websocket: WebSocket, tickers: str):
     """
-    **Асинхронный WebSocket для живых цен (Stable Version).**
+    **Асинхронный WebSocket для живых цен (Production Ready).**
     
     Принимает список тикеров через запятую.
     
     1. **Инициализация:** Мгновенно отправляет текущее состояние кэша.
     2. **Real-time (Primary):** Подключается к yfinance WebSocket.
-       - Глушит лишние логи.
-       - Обновляет High/Low/Volume/Time.
-       - При разрыве соединения мгновенно останавливает обработку.
+       - Использует "всеядную" функцию очистки данных.
+       - Корректно обновляет кэш.
+       - При ошибке отправки клиенту (разрыв) мгновенно останавливается.
     3. **Fallback (Backup):** Если Real-time не работает, переходит на HTTP polling.
     
     URL: wss://app.domain.name.or.ip/ws/price/eslt.ta,teva.ta,dfns.l,aapl
@@ -276,7 +295,7 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     
     if initial_data:
         try:
-            # Обязательно чистим от NaN!
+            # Очищаем данные перед отправкой (защита от краша)
             await websocket.send_json(clean_for_json(initial_data))
         except Exception:
             return # Клиент отключился сразу
@@ -293,19 +312,20 @@ async def websocket_price(websocket: WebSocket, tickers: str):
         iterator = await aws.listen()
 
         async for message in iterator:
-            # Сразу проверяем, не нужно ли данные игнорировать
-            if message is None: 
+            # Если сообщение пустое - пропускаем
+            if not message: 
                 continue
 
             sym = message.get('id')
-            # Обрабатываем только запрошенные тикеры, которые есть в кэше
+            
+            # Обрабатываем только если тикер валидный и есть в нашем кэше
             if sym and sym in BASE_DATA_CACHE:
                 cached_item = BASE_DATA_CACHE[sym]
                 
                 # --- А. ОБРАБОТКА ВРЕМЕНИ ---
                 raw_time = message.get('time')
                 if raw_time:
-                    # Конвертируем Unix timestamp (мс) в читаемый UTC ISO формат
+                    # Конвертируем Unix timestamp (мс) в UTC ISO
                     dt_object = datetime.fromtimestamp(raw_time / 1000, tz=timezone.utc)
                     cached_item['date'] = dt_object.isoformat()
                     cached_item['timestamp_raw'] = raw_time 
@@ -323,15 +343,16 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                     cached_item['volume'] = message.get('dayVolume')
 
                 # --- Г. УМНОЕ ОБНОВЛЕНИЕ HIGH/LOW ---
-                # Обновляем High/Low только если пришли явные данные или мы в REGULAR сессии
+                # 1. Если Yahoo прислал dayHigh/dayLow - верим им.
+                # 2. Иначе обновляем сами, но ТОЛЬКО в REGULAR сессию.
                 
                 # High
                 if message.get('dayHigh'):
                     cached_item['day_high'] = message.get('dayHigh')
                 elif new_price and market_phase == 'REGULAR':
                     curr_h = cached_item.get('day_high')
-                    # Проверка на None/NaN
-                    if curr_h is None or (isinstance(curr_h, float) and np.isnan(curr_h)) or new_price > curr_h:
+                    # Сравниваем аккуратно, учитывая None
+                    if curr_h is None or clean_for_json(curr_h) is None or new_price > curr_h:
                         cached_item['day_high'] = new_price
                         
                 # Low
@@ -339,52 +360,52 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                     cached_item['day_low'] = message.get('dayLow')
                 elif new_price and market_phase == 'REGULAR':
                     curr_l = cached_item.get('day_low')
-                    # Проверка на None/NaN
-                    if curr_l is None or (isinstance(curr_l, float) and np.isnan(curr_l)) or new_price < curr_l:
+                    # Сравниваем аккуратно, учитывая None
+                    if curr_l is None or clean_for_json(curr_l) is None or new_price < curr_l:
                         cached_item['day_low'] = new_price
 
-                # Процент изменения
+                # Change Percent
                 if message.get('changePercent') is not None:
                      cached_item['change_percent'] = message.get('changePercent')
                 
                 cached_item['source'] = 'REALTIME_SOCKET' 
 
-                # --- ОТПРАВКА КЛИЕНТУ С ПРОВЕРКОЙ ---
+                # --- ОТПРАВКА КЛИЕНТУ ---
                 try:
-                    # Чистим от NaN и отправляем
-                    await websocket.send_json(clean_for_json({sym: cached_item}))
+                    # Чистим ВСЁ перед отправкой. Это ключевой момент фикса.
+                    payload = clean_for_json({sym: cached_item})
+                    await websocket.send_json(payload)
+                    
+                    # Даем циклу событий "выдохнуть", чтобы отправка успела пройти
+                    await asyncio.sleep(0) 
+                    
                 except (WebSocketDisconnect, ConnectionClosedError):
-                    # Если отправка не удалась (клиент ушел) - ПРЕРЫВАЕМ ЦИКЛ НЕМЕДЛЕННО
-                    logger.info("Client disconnected during send. Stopping loop.")
+                    # Клиент ушел - прерываем цикл yfinance
                     break
                 except Exception as send_err:
-                    # Если другая ошибка (например, сериализация), пишем в лог, но пробуем дальше
-                    logger.error(f"Send error: {send_err}")
+                    # Логируем ошибку отправки, но пробуем работать дальше
+                    logger.error(f"Error sending JSON to client: {send_err}")
 
     except WebSocketDisconnect:
-        logger.info("Client disconnected gracefully.")
-        return # Выход, fallback не нужен
+        # Штатное отключение
+        pass
+        return 
         
     except Exception as e:
         logger.warning(f"WebSocket General Error ({e}). Switching to Polling Fallback...")
-        # Если упало подключение к Yahoo, идем ниже к Fallback
+        # Падаем вниз, в Fallback
         
     finally:
-        # ВАЖНО: Принудительно убиваем объект подписки.
-        # Это должно остановить поток "зомби-логов".
+        # Убиваем объект подписки yfinance, чтобы остановить логи
         if aws:
             del aws 
 
     # -----------------------------------------------------------
     # 3. FALLBACK (HTTP Polling)
-    # Запускается только если Real-time блок упал с ошибкой
+    # Запускается, если живой сокет упал
     # -----------------------------------------------------------
     try:
         while True:
-            # Проверка дисконнекта перед запросом
-            if websocket.client_state.name == "DISCONNECTED":
-                break
-
             updates = {}
             for sym in ticker_list:
                 data = get_combined_quote(sym)
@@ -393,20 +414,15 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                     updates[sym] = data
             
             if updates:
-                await websocket.send_json(clean_for_json(updates))
+                try:
+                    await websocket.send_json(clean_for_json(updates))
+                except Exception:
+                    break # Если не смогли отправить при поллинге - выходим
             
             await asyncio.sleep(5) 
 
-    except (WebSocketDisconnect, RuntimeError, ConnectionClosedError):
-            logger.info("Client disconnected during polling.")
-            return 
-            
-    except Exception as poll_error:
-        logger.error(f"Polling crashed: {poll_error}")
-        try:
-            await websocket.close(code=1011)
-        except:
-            pass # Если сокет уже мертв, ничего не делаем
+    except Exception:
+        pass # Если сокет уже мертв, ничего не делаем
             
 
 # --- ИСТОРИЧЕСКИЕ ДАННЫЕ ---
