@@ -15,9 +15,9 @@ from websockets.exceptions import ConnectionClosedError
 
 # --- НАСТРОЙКА ЛОГОВ ---
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("PRO_LEAD")
+logger = logging.getLogger("PRO_LEAD_STREAMER")
 
-app = FastAPI(title="YFinance Enterprise Streamer v3")
+app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"])
 
 
@@ -68,7 +68,6 @@ EXCHANGE_MAP = {
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def clean_val(val):
-    """Очистка данных для JSON."""
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return None
     if isinstance(val, (np.integer, int)): return int(val)
@@ -228,61 +227,75 @@ def get_multiple_quotes(
 @app.websocket("/ws/price/{tickers}")
 async def websocket_price(websocket: WebSocket, tickers: str):
     await websocket.accept()
-    ticker_symbols = [s.strip().upper() for s in tickers.split(",")]
+    symbols = [s.strip().upper() for s in tickers.split(",")]
     
-    # Shared state
+    # Локальный кэш состояния
     state: Dict[str, Dict[str, Any]] = {}
+    # Кэш метаданных (чтобы не дергать info каждую секунду)
+    metadata_cache: Dict[str, Dict[str, Any]] = {}
     stop_event = asyncio.Event()
 
-    async def update_ticker_state(symbol: str, force_rest=False):
-        """Обновляет состояние конкретного тикера через REST API."""
+    async def fetch_metadata(symbol: str):
+        """Тяжелый запрос для получения биржевой инфо."""
         try:
             t = yf.Ticker(symbol)
-            # В праздники fast_info может быть пуст, берем из базового info если нужно
-            f = t.fast_info
-            
-            # Собираем данные максимально безопасно
-            price = clean_val(safe_get(f, 'last_price'))
-            prev_close = clean_val(safe_get(f, 'previous_close'))
-            
-            # Расчет изменения
-            change_pct = 0.0
-            if price and prev_close:
-                change_pct = round(((price - prev_close) / prev_close) * 100, 2)
-
-            m_state = safe_get(f, 'market_state', 'UNKNOWN').upper()
-            
-            new_data = {
-                "symbol": symbol,
-                "current_price": price,
-                "change_percent": change_pct,
-                "open": clean_val(safe_get(f, 'open')),
-                "high": clean_val(safe_get(f, 'day_high')),
-                "low": clean_val(safe_get(f, 'day_low')),
-                "volume": clean_val(safe_get(f, 'last_volume')),
-                "previous_close": prev_close,
-                "currency": safe_get(f, 'currency', 'USD'),
-                "exchange": safe_get(f, 'exchange', 'N/A'),
-                "market_stage": MARKET_STAGE_MAP.get(m_state, m_state),
-                "trade_date": datetime.now(timezone.utc).isoformat(),
-                "source": "api_refresh" if force_rest else "init"
+            info = t.info
+            # Собираем то, что не меняется каждую секунду
+            metadata_cache[symbol] = {
+                "exchange": info.get("exchange", "N/A"),
+                "currency": info.get("currency", "USD"),
+                "market_stage": info.get("marketState", "OFF"), # Вот тут живет стадия рынка
+                "long_name": info.get("longName"),
+                "prev_close": info.get("previousClose")
             }
-            
-            if symbol in state:
-                state[symbol].update(new_data)
-            else:
-                state[symbol] = new_data
-                
         except Exception as e:
-            logger.error(f"Error updating {symbol}: {e}")
+            logger.error(f"Metadata fetch failed for {symbol}: {e}")
+            metadata_cache[symbol] = {"market_stage": "UNKNOWN"}
 
-    # 1. Поток Yahoo WebSocket (Live Stream)
-    async def yahoo_streamer():
+    async def update_state_rest(symbol: str, source="api_refresh"):
+        """Легкий запрос через fast_info + metadata_cache."""
+        try:
+            t = yf.Ticker(symbol)
+            fast = t.fast_info
+            meta = metadata_cache.get(symbol, {})
+            
+            # Если сегодня праздник, берем время последней сессии
+            try:
+                # В yfinance fast.last_price иногда обновляется даже когда биржа закрыта
+                price = clean_val(fast.last_price)
+                prev_close = clean_val(meta.get("prev_close") or fast.previous_close)
+                
+                change_pct = 0.0
+                if price and prev_close:
+                    change_pct = round(((price - prev_close) / prev_close) * 100, 2)
+
+                state[symbol] = {
+                    "symbol": symbol,
+                    "current_price": price,
+                    "change_percent": change_pct,
+                    "open": clean_val(fast.open),
+                    "high": clean_val(fast.day_high),
+                    "low": clean_val(fast.day_low),
+                    "volume": clean_val(fast.last_volume),
+                    "previous_close": prev_close,
+                    "currency": meta.get("currency"),
+                    "exchange": meta.get("exchange"),
+                    "market_stage": meta.get("market_stage"),
+                    # Используем время последней сделки из fast_info если доступно
+                    "trade_date": fast.last_price_timestamp.isoformat() if hasattr(fast, 'last_price_timestamp') else datetime.now(timezone.utc).isoformat(),
+                    "source": source
+                }
+            except Exception as e:
+                logger.warning(f"Fast info failed for {symbol}: {e}")
+        except Exception as e:
+            logger.error(f"REST update failed for {symbol}: {e}")
+
+    async def yahoo_ws_task():
+        """Поток живых данных."""
         while not stop_event.is_set():
             try:
                 aws = AsyncWebSocket()
-                # Подписка может вернуть None, если Yahoo сбросил соединение
-                success = await aws.subscribe(ticker_symbols)
+                await aws.subscribe(symbols)
                 iterator = await aws.listen()
                 
                 if iterator is None:
@@ -295,66 +308,59 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                     
                     sym = msg['id']
                     if sym in state:
+                        # Обновляем только то, что пришло в сокете
                         s = state[sym]
-                        s.update({
-                            "current_price": clean_val(msg.get('price', s["current_price"])),
-                            "change_percent": round(msg.get('changePercent', s["change_percent"]), 2),
-                            "volume": clean_val(msg.get('dayVolume', s["volume"])),
-                            "source": "live_stream"
-                        })
+                        s["current_price"] = clean_val(msg.get('price', s["current_price"]))
+                        s["change_percent"] = round(msg.get('changePercent', s["change_percent"]), 2)
+                        s["volume"] = clean_val(msg.get('dayVolume', s["volume"]))
+                        s["source"] = "live_stream"
                         if 'time' in msg:
-                            s["trade_date"] = datetime.fromtimestamp(int(msg['time'])/1000, tz=timezone.utc).isoformat()
-            except Exception as e:
-                logger.error(f"WS Streamer error: {e}")
-                await asyncio.sleep(5)
-
-    # 2. Фоновое обновление (REST API) - для High/Low и стадий рынка
-    async def metadata_updater():
-        while not stop_event.is_set():
-            try:
-                # Обновляем по одному, чтобы не блокировать цикл
-                for sym in ticker_symbols:
-                    if stop_event.is_set(): break
-                    await update_ticker_state(sym, force_rest=True)
-                    await asyncio.sleep(1) # Небольшая пауза между тикерами
+                            # Yahoo шлет таймстамп в мс
+                            s["trade_date"] = datetime.fromtimestamp(msg['time']/1000, tz=timezone.utc).isoformat()
                 
-                await asyncio.sleep(10) # Общая пауза цикла
             except Exception as e:
-                logger.error(f"Metadata Task error: {e}")
+                logger.error(f"WS Runtime error: {e}")
                 await asyncio.sleep(5)
 
-    # 3. Отправка данных клиенту
-    async def broadcaster():
+    async def polling_task():
+        """Обновление метаданных и фоновый поллинг."""
         while not stop_event.is_set():
             try:
-                if state:
-                    # Важно: шлем копию, чтобы избежать RuntimeError при изменении словаря
-                    payload = json.dumps(clean_val(state))
-                    await websocket.send_text(payload)
-                await asyncio.sleep(1)
-            except (WebSocketDisconnect, ConnectionClosedError):
-                stop_event.set()
+                for sym in symbols:
+                    # Раз в 30 секунд обновляем стадию рынка (через тяжелый info)
+                    await fetch_metadata(sym)
+                    # И сразу обновляем состояние через легкий REST
+                    await update_state_rest(sym, source="api_refresh")
+                    await asyncio.sleep(1) # Пауза между тикерами
+                
+                await asyncio.sleep(20) # Пауза перед следующим циклом
             except Exception as e:
-                stop_event.set()
+                logger.error(f"Polling error: {e}")
+                await asyncio.sleep(10)
 
-    # --- СТАРТ ---
-    # 1. Первая инициализация (ждем её)
-    await asyncio.gather(*[update_ticker_state(s) for s in ticker_symbols])
+    # --- STARTUP ---
+    # 1. Сначала метаданные (один раз)
+    await asyncio.gather(*[fetch_metadata(s) for s in symbols])
+    # 2. Первичный слепок цен
+    await asyncio.gather(*[update_state_rest(s, source="init") for s in symbols])
     
-    # 2. Запуск фоновых процессов
+    # 3. Запуск фоновых задач
     tasks = [
-        asyncio.create_task(yahoo_streamer()),
-        asyncio.create_task(metadata_updater()),
-        asyncio.create_task(broadcaster())
+        asyncio.create_task(yahoo_ws_task()),
+        asyncio.create_task(polling_task())
     ]
 
     try:
-        await stop_event.wait()
+        while not stop_event.is_set():
+            if state:
+                await websocket.send_text(json.dumps(state))
+            await asyncio.sleep(1)
+    except (WebSocketDisconnect, ConnectionClosedError):
+        pass
     finally:
         stop_event.set()
         for t in tasks: t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        logger.info(f"Connection cleaned up for {tickers}")
+        logger.info(f"Cleaned up {tickers}")
             
 
 
