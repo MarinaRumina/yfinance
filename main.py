@@ -70,9 +70,8 @@ EXCHANGE_MAP = {
 def clean_val(val):
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return None
-    if isinstance(val, (np.integer, int)): return int(val)
-    if isinstance(val, (np.floating, float)): return float(val)
-    return val
+    return float(val) if isinstance(val, (float, np.floating)) else val
+    
 
 def safe_get(obj, attr, default=None):
     """Безопасное извлечение атрибута из объектов yfinance."""
@@ -229,138 +228,107 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     await websocket.accept()
     symbols = [s.strip().upper() for s in tickers.split(",")]
     
-    # Локальный кэш состояния
-    state: Dict[str, Dict[str, Any]] = {}
-    # Кэш метаданных (чтобы не дергать info каждую секунду)
-    metadata_cache: Dict[str, Dict[str, Any]] = {}
+    state: Dict[str, Any] = {}
     stop_event = asyncio.Event()
 
-    async def fetch_metadata(symbol: str):
-        """Тяжелый запрос для получения биржевой инфо."""
+    async def safe_update_ticker(symbol: str, is_init=False):
+        """Универсальный и безопасный метод получения данных."""
         try:
             t = yf.Ticker(symbol)
-            info = t.info
-            # Собираем то, что не меняется каждую секунду
-            metadata_cache[symbol] = {
-                "exchange": info.get("exchange", "N/A"),
-                "currency": info.get("currency", "USD"),
-                "market_stage": info.get("marketState", "OFF"), # Вот тут живет стадия рынка
-                "long_name": info.get("longName"),
-                "prev_close": info.get("previousClose")
+            
+            # Для валют (=X) fast_info почти всегда бесполезен или вызывает 404
+            is_forex = "=X" in symbol or symbol.endswith("=X")
+            
+            price, prev_close, m_stage = None, None, "UNKNOWN"
+            
+            if is_forex:
+                # Специальный метод для Forex
+                hist = t.history(period="1d")
+                if not hist.empty:
+                    price = clean_val(hist['Close'].iloc[-1])
+                    prev_close = clean_val(t.info.get('previousClose'))
+                m_stage = "REGULAR" # Forex почти всегда активен
+            else:
+                # Для акций пытаемся использовать быстрый метод
+                try:
+                    f = t.fast_info
+                    price = clean_val(f.last_price)
+                    prev_close = clean_val(f.previous_close)
+                    m_stage = t.info.get('marketState', 'UNKNOWN')
+                except:
+                    # Если fast_info подвел, берем из info
+                    info = t.info
+                    price = clean_val(info.get('currentPrice') or info.get('regularMarketPrice'))
+                    prev_close = clean_val(info.get('previousClose'))
+                    m_stage = info.get('marketState', 'UNKNOWN')
+
+            change_pct = 0.0
+            if price and prev_close:
+                change_pct = round(((price - prev_close) / prev_close) * 100, 2)
+
+            state[symbol] = {
+                "symbol": symbol,
+                "current_price": price,
+                "change_percent": change_pct,
+                "previous_close": prev_close,
+                "market_stage": m_stage,
+                "trade_date": datetime.now(timezone.utc).isoformat(),
+                "source": "init" if is_init else "api_refresh"
             }
         except Exception as e:
-            logger.error(f"Metadata fetch failed for {symbol}: {e}")
-            metadata_cache[symbol] = {"market_stage": "UNKNOWN"}
-
-    async def update_state_rest(symbol: str, source="api_refresh"):
-        """Легкий запрос через fast_info + metadata_cache."""
-        try:
-            t = yf.Ticker(symbol)
-            fast = t.fast_info
-            meta = metadata_cache.get(symbol, {})
-            
-            # Если сегодня праздник, берем время последней сессии
-            try:
-                # В yfinance fast.last_price иногда обновляется даже когда биржа закрыта
-                price = clean_val(fast.last_price)
-                prev_close = clean_val(meta.get("prev_close") or fast.previous_close)
-                
-                change_pct = 0.0
-                if price and prev_close:
-                    change_pct = round(((price - prev_close) / prev_close) * 100, 2)
-
-                state[symbol] = {
-                    "symbol": symbol,
-                    "current_price": price,
-                    "change_percent": change_pct,
-                    "open": clean_val(fast.open),
-                    "high": clean_val(fast.day_high),
-                    "low": clean_val(fast.day_low),
-                    "volume": clean_val(fast.last_volume),
-                    "previous_close": prev_close,
-                    "currency": meta.get("currency"),
-                    "exchange": meta.get("exchange"),
-                    "market_stage": meta.get("market_stage"),
-                    # Используем время последней сделки из fast_info если доступно
-                    "trade_date": fast.last_price_timestamp.isoformat() if hasattr(fast, 'last_price_timestamp') else datetime.now(timezone.utc).isoformat(),
-                    "source": source
-                }
-            except Exception as e:
-                logger.warning(f"Fast info failed for {symbol}: {e}")
-        except Exception as e:
-            logger.error(f"REST update failed for {symbol}: {e}")
+            logger.warning(f"Failed to update {symbol}: {e}")
 
     async def yahoo_ws_task():
-        """Поток живых данных."""
+        """Живой поток. Если для тикера нет обновлений (как для Forex в выходные), он просто молчит."""
         while not stop_event.is_set():
             try:
                 aws = AsyncWebSocket()
                 await aws.subscribe(symbols)
                 iterator = await aws.listen()
-                
-                if iterator is None:
-                    await asyncio.sleep(5)
-                    continue
-
-                async for msg in iterator:
-                    if stop_event.is_set(): break
-                    if not msg or 'id' not in msg: continue
-                    
-                    sym = msg['id']
-                    if sym in state:
-                        # Обновляем только то, что пришло в сокете
-                        s = state[sym]
-                        s["current_price"] = clean_val(msg.get('price', s["current_price"]))
-                        s["change_percent"] = round(msg.get('changePercent', s["change_percent"]), 2)
-                        s["volume"] = clean_val(msg.get('dayVolume', s["volume"]))
-                        s["source"] = "live_stream"
-                        if 'time' in msg:
-                            # Yahoo шлет таймстамп в мс
-                            s["trade_date"] = datetime.fromtimestamp(msg['time']/1000, tz=timezone.utc).isoformat()
-                
+                if iterator:
+                    async for msg in iterator:
+                        if stop_event.is_set(): break
+                        sym = msg.get('id')
+                        if sym and sym in state:
+                            state[sym].update({
+                                "current_price": clean_val(msg.get('price', state[sym]["current_price"])),
+                                "change_percent": round(msg.get('changePercent', state[sym]["change_percent"]), 2),
+                                "source": "live_stream",
+                                "trade_date": datetime.now(timezone.utc).isoformat()
+                            })
             except Exception as e:
-                logger.error(f"WS Runtime error: {e}")
-                await asyncio.sleep(5)
-
-    async def polling_task():
-        """Обновление метаданных и фоновый поллинг."""
-        while not stop_event.is_set():
-            try:
-                for sym in symbols:
-                    # Раз в 30 секунд обновляем стадию рынка (через тяжелый info)
-                    await fetch_metadata(sym)
-                    # И сразу обновляем состояние через легкий REST
-                    await update_state_rest(sym, source="api_refresh")
-                    await asyncio.sleep(1) # Пауза между тикерами
-                
-                await asyncio.sleep(20) # Пауза перед следующим циклом
-            except Exception as e:
-                logger.error(f"Polling error: {e}")
+                logger.error(f"WS Error: {e}")
                 await asyncio.sleep(10)
 
-    # --- STARTUP ---
-    # 1. Сначала метаданные (один раз)
-    await asyncio.gather(*[fetch_metadata(s) for s in symbols])
-    # 2. Первичный слепок цен
-    await asyncio.gather(*[update_state_rest(s, source="init") for s in symbols])
-    
-    # 3. Запуск фоновых задач
-    tasks = [
-        asyncio.create_task(yahoo_ws_task()),
-        asyncio.create_task(polling_task())
-    ]
+    async def polling_task():
+        """Фоновый апдейт для тех, кто не шлет данные в сокет (Forex/Выходные)."""
+        while not stop_event.is_set():
+            await asyncio.sleep(30) # Не частим, чтобы не получить 404
+            for sym in symbols:
+                if stop_event.is_set(): break
+                await safe_update_ticker(sym)
+                await asyncio.sleep(1)
+
+    # --- ЗАПУСК ---
+    # 1. Инициализация (ждем её, чтобы клиент сразу получил хоть что-то)
+    init_tasks = [safe_update_ticker(s, is_init=True) for s in symbols]
+    await asyncio.gather(*init_tasks)
+
+    # 2. Потоки
+    ws_t = asyncio.create_task(yahoo_ws_task())
+    poll_t = asyncio.create_task(polling_task())
 
     try:
         while not stop_event.is_set():
             if state:
                 await websocket.send_text(json.dumps(state))
             await asyncio.sleep(1)
-    except (WebSocketDisconnect, ConnectionClosedError):
-        pass
+    except (WebSocketDisconnect):
+        logger.info("Client disconnected")
     finally:
         stop_event.set()
-        for t in tasks: t.cancel()
-        logger.info(f"Cleaned up {tickers}")
+        ws_t.cancel()
+        poll_t.cancel()
             
 
 
