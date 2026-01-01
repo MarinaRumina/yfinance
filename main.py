@@ -12,17 +12,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from yfinance import AsyncWebSocket
 from websockets.exceptions import ConnectionClosedError
 
-
-# --- НАСТРОЙКА ЛОГОВ ---
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("API_LEAD")
-
-app = FastAPI(title="YFinance Pro Streamer")
-app.add_middleware(CORSMiddleware, allow_origins=["*"])
-
 # ПРОВЕРКА ВЕРСИИ ПРИ ЗАПУСКЕ
 logger.info(f"🚀 YFINANCE VERSION INSTALLED: {yf.__version__}")
 
+# --- НАСТРОЙКА ЛОГОВ ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("PRO_LEAD")
+
+app = FastAPI(title="YFinance Enterprise Streamer v3")
+app.add_middleware(CORSMiddleware, allow_origins=["*"])
 
 app = FastAPI(
     title="YFinance Ultimate API", 
@@ -37,15 +35,17 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-# Глобальный маппинг стадий рынка для читаемости
+# Расширенная карта состояний рынка
 MARKET_STAGE_MAP = {
     "PRE": "Pre-Market",
     "POST": "After-Hours",
     "CLOSED": "Closed",
     "REGULAR": "Regular",
     "PREPRE": "Early-Morning",
-    "POSTPOST": "Overnight"
+    "POSTPOST": "Overnight",
+    "OFF": "Holiday/Closed"
 }
+
 
 # --- ГЛОБАЛЬНЫЙ КЭШ ДЛЯ СТАТИЧНЫХ ДАННЫХ ДНЯ ---
 # Структура: {"AAPL": {"open": 150.0, "high": 155.0, ... "cache_date": "2025-12-29"}}
@@ -68,11 +68,20 @@ def clean_val(val):
     """Очистка данных для JSON."""
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return None
-    if isinstance(val, (np.integer, int)):
-        return int(val)
-    if isinstance(val, (np.floating, float)):
-        return float(val)
+    if isinstance(val, (np.integer, int)): return int(val)
+    if isinstance(val, (np.floating, float)): return float(val)
     return val
+
+def safe_get(obj, attr, default=None):
+    """Безопасное извлечение атрибута из объектов yfinance."""
+    try:
+        # Пытаемся получить как атрибут, потом как элемент словаря
+        res = getattr(obj, attr, None)
+        if res is None and hasattr(obj, 'get'):
+            res = obj.get(attr)
+        return res if res is not None else default
+    except:
+        return default
 
 
 def normalize_value(v: Any) -> Any:
@@ -87,6 +96,7 @@ def normalize_value(v: Any) -> Any:
         if isinstance(v, dict): return {str(k): normalize_value(val) for k, val in v.items()}
         return [normalize_value(i) for i in v]
     return v
+
 
 def get_ticker_base_data(symbol: str, t_obj):
     """Обновляет кэш базовых цен открытия/закрытия один раз в день."""
@@ -217,51 +227,62 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     await websocket.accept()
     ticker_symbols = [s.strip().upper() for s in tickers.split(",")]
     
-    # Хранилище состояния для этого клиента
-    # Позволяет объединять данные из разных источников (WS и REST API)
+    # Shared state
     state: Dict[str, Dict[str, Any]] = {}
     stop_event = asyncio.Event()
 
-    # 1. Функция инициализации состояния (забираем базу и стадию рынка)
-    async def init_ticker_state(symbol: str):
+    async def update_ticker_state(symbol: str, force_rest=False):
+        """Обновляет состояние конкретного тикера через REST API."""
         try:
             t = yf.Ticker(symbol)
-            info = t.info # Один раз берем полный info для метаданных
-            fast = t.fast_info
+            # В праздники fast_info может быть пуст, берем из базового info если нужно
+            f = t.fast_info
             
-            state[symbol] = {
-                "symbol": symbol,
-                "current_price": clean_val(fast.last_price),
-                "change_percent": 0.0,
-                "open": clean_val(fast.open),
-                "high": clean_val(fast.day_high),
-                "low": clean_val(fast.day_low),
-                "volume": clean_val(fast.last_volume),
-                "previous_close": clean_val(fast.previous_close),
-                "currency": fast.get('currency', 'USD'),
-                "exchange": fast.get('exchange', 'N/A'),
-                "market_stage": MARKET_STAGE_MAP.get(fast.get('market_state'), fast.get('market_state')),
-                "trade_date": datetime.now(timezone.utc).isoformat(), # Изначально ставим серверное
-                "source": "init"
-            }
-            # Считаем процент
-            cp = state[symbol]["current_price"]
-            pc = state[symbol]["previous_close"]
-            if cp and pc:
-                state[symbol]["change_percent"] = round(((cp - pc) / pc) * 100, 2)
-        except Exception as e:
-            logger.error(f"Init error for {symbol}: {e}")
+            # Собираем данные максимально безопасно
+            price = clean_val(safe_get(f, 'last_price'))
+            prev_close = clean_val(safe_get(f, 'previous_close'))
+            
+            # Расчет изменения
+            change_pct = 0.0
+            if price and prev_close:
+                change_pct = round(((price - prev_close) / prev_close) * 100, 2)
 
-    # 2. Поток Yahoo WebSocket (Live Stream)
+            m_state = safe_get(f, 'market_state', 'UNKNOWN').upper()
+            
+            new_data = {
+                "symbol": symbol,
+                "current_price": price,
+                "change_percent": change_pct,
+                "open": clean_val(safe_get(f, 'open')),
+                "high": clean_val(safe_get(f, 'day_high')),
+                "low": clean_val(safe_get(f, 'day_low')),
+                "volume": clean_val(safe_get(f, 'last_volume')),
+                "previous_close": prev_close,
+                "currency": safe_get(f, 'currency', 'USD'),
+                "exchange": safe_get(f, 'exchange', 'N/A'),
+                "market_stage": MARKET_STAGE_MAP.get(m_state, m_state),
+                "trade_date": datetime.now(timezone.utc).isoformat(),
+                "source": "api_refresh" if force_rest else "init"
+            }
+            
+            if symbol in state:
+                state[symbol].update(new_data)
+            else:
+                state[symbol] = new_data
+                
+        except Exception as e:
+            logger.error(f"Error updating {symbol}: {e}")
+
+    # 1. Поток Yahoo WebSocket (Live Stream)
     async def yahoo_streamer():
         while not stop_event.is_set():
             try:
                 aws = AsyncWebSocket()
-                await aws.subscribe(ticker_symbols)
+                # Подписка может вернуть None, если Yahoo сбросил соединение
+                success = await aws.subscribe(ticker_symbols)
                 iterator = await aws.listen()
                 
                 if iterator is None:
-                    logger.warning("WS Iterator is None, retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
@@ -271,63 +292,53 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                     
                     sym = msg['id']
                     if sym in state:
-                        # Обновляем только динамические поля из WS
                         s = state[sym]
-                        s["current_price"] = clean_val(msg.get('price', s["current_price"]))
-                        s["change_percent"] = clean_val(round(msg.get('changePercent', s["change_percent"]), 2))
-                        s["volume"] = clean_val(msg.get('dayVolume', s["volume"]))
-                        # Время из сообщения Yahoo (мс -> ISO)
+                        s.update({
+                            "current_price": clean_val(msg.get('price', s["current_price"])),
+                            "change_percent": round(msg.get('changePercent', s["change_percent"]), 2),
+                            "volume": clean_val(msg.get('dayVolume', s["volume"])),
+                            "source": "live_stream"
+                        })
                         if 'time' in msg:
                             s["trade_date"] = datetime.fromtimestamp(int(msg['time'])/1000, tz=timezone.utc).isoformat()
-                        s["source"] = "live_stream"
-                
             except Exception as e:
-                logger.error(f"Streamer loop error: {e}")
-                await asyncio.sleep(5) # Пауза перед реконнектом
+                logger.error(f"WS Streamer error: {e}")
+                await asyncio.sleep(5)
 
-    # 3. Фоновое обновление метаданных (стадия рынка, high/low)
+    # 2. Фоновое обновление (REST API) - для High/Low и стадий рынка
     async def metadata_updater():
         while not stop_event.is_set():
             try:
+                # Обновляем по одному, чтобы не блокировать цикл
                 for sym in ticker_symbols:
-                    t = yf.Ticker(sym)
-                    fast = t.fast_info
-                    if sym in state:
-                        s = state[sym]
-                        # Обновляем то, что не дает обычный вебсокет
-                        s["market_stage"] = MARKET_STAGE_MAP.get(fast.market_state, fast.market_state)
-                        s["high"] = max(clean_val(fast.day_high) or 0, s["high"] or 0)
-                        s["low"] = min(clean_val(fast.day_low) or 99999999, s["low"] or 99999999)
-                        
-                        # Если стрим не работает (например, для ESLT.TA), обновляем цену отсюда
-                        if s["source"] != "live_stream":
-                            s["current_price"] = clean_val(fast.last_price)
-                            s["source"] = "api_polling"
+                    if stop_event.is_set(): break
+                    await update_ticker_state(sym, force_rest=True)
+                    await asyncio.sleep(1) # Небольшая пауза между тикерами
                 
-                await asyncio.sleep(10) # Метаданные (стадия рынка) не меняются часто
+                await asyncio.sleep(10) # Общая пауза цикла
             except Exception as e:
-                logger.error(f"Metadata update error: {e}")
+                logger.error(f"Metadata Task error: {e}")
                 await asyncio.sleep(5)
 
-    # 4. Бродкастер (отправка данных клиенту)
+    # 3. Отправка данных клиенту
     async def broadcaster():
         while not stop_event.is_set():
             try:
                 if state:
-                    # Отправляем текущий снимок состояния
-                    await websocket.send_json({k: clean_val(v) for k, v in state.items()})
-                await asyncio.sleep(1) # Частота обновления экрана клиента
+                    # Важно: шлем копию, чтобы избежать RuntimeError при изменении словаря
+                    payload = json.dumps(clean_val(state))
+                    await websocket.send_text(payload)
+                await asyncio.sleep(1)
             except (WebSocketDisconnect, ConnectionClosedError):
                 stop_event.set()
             except Exception as e:
-                logger.error(f"Broadcast error: {e}")
                 stop_event.set()
 
-    # --- ЗАПУСК ---
-    # Инициализация (делаем последовательно, чтобы клиент сразу получил базу)
-    await asyncio.gather(*[init_ticker_state(s) for s in ticker_symbols])
+    # --- СТАРТ ---
+    # 1. Первая инициализация (ждем её)
+    await asyncio.gather(*[update_ticker_state(s) for s in ticker_symbols])
     
-    # Запуск параллельных задач
+    # 2. Запуск фоновых процессов
     tasks = [
         asyncio.create_task(yahoo_streamer()),
         asyncio.create_task(metadata_updater()),
@@ -337,9 +348,10 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     try:
         await stop_event.wait()
     finally:
+        stop_event.set()
         for t in tasks: t.cancel()
-        logger.info(f"WebSocket closed for {tickers}")
-            
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info(f"Connection cleaned up for {tickers}")
             
 
 
