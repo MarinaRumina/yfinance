@@ -206,108 +206,109 @@ def get_multiple_quotes(
 
 
 
-# --- ОСНОВНОЙ ВЕБ-СОКЕТ ---
+# --- ОБНОВЛЕННЫЙ ВЕБСОКЕТ С РАЗДЕЛЕНИЕМ ПОТОКОВ ---
 
 @app.websocket("/ws/price/{tickers}")
 async def websocket_price(websocket: WebSocket, tickers: str):
-    """
-    **Высокопроизводительный WebSocket для мониторинга цен.**
-    
-    1. **Мгновенный ответ**: Сразу после подключения шлет последние данные из API.
-    2. **Real-time**: Подключается к стриму Yahoo (только для активных рынков, чаще US).
-    3. **Polling Fallback**: Если стрим молчит, автоматически обновляет данные раз в 5 сек.
-    
-    URL: wss://app.domain.name.or.ip/ws/price/eslt.ta,teva.ta,dfns.l,aapl
-    """
     await websocket.accept()
     ticker_list = [s.strip().upper() for s in tickers.split(",")]
-    logger.info(f"Connected: {tickers}")
+    
+    # Общее состояние для всех тикеров в этом соединении
+    # Сюда будут писать данные и WS, и Polling
+    latest_data = {}
+    
+    # Флаг для остановки фоновых задач
+    stop_event = asyncio.Event()
 
-    async def send_to_client(data: dict):
-        """Вспомогательная функция для безопасной отправки JSON."""
+    # 1. ФУНКЦИЯ ПОЛУЧЕНИЯ ДАННЫХ ИЗ YAHOO WEBSOCKET
+    async def listen_yahoo_ws():
+        aws = AsyncWebSocket()
         try:
-            clean_data = clean_for_json(data)
-            await websocket.send_json(clean_data)
-        except (WebSocketDisconnect, ConnectionClosedError):
-            return False
-        except Exception as e:
-            logger.error(f"Send error: {e}")
-            return False
-    
-    # -------------------------------------------------------
-    # ШАГ 1: МГНОВЕННЫЙ ПУШ ПРИ ПОДКЛЮЧЕНИИ
-    # -------------------------------------------------------
-    initial_data = {}
-    for sym in ticker_list:
-        q = get_combined_quote(sym)
-        if q:
-            q['source'] = 'initial_sync'
-            initial_data[sym] = q
-    
-    if initial_data:
-        await send_to_client(initial_data)
-
-    # -------------------------------------------------------
-    # ШАГ 2: ПОТОКОВАЯ ОБРАБОТКА
-    # -------------------------------------------------------
-    aws = AsyncWebSocket()
-    
-    try:
-        # Пытаемся запустить нативный вебсокет yfinance
-        await aws.subscribe(ticker_list)
-        iterator = await aws.listen()
-
-        # Создаем задачу для пинга (чтобы соединение не тухло)
-        async def heartbeat():
-            while True:
-                await asyncio.sleep(15)
-                await send_to_client({"type": "ping", "timestamp": datetime.now().isoformat()})
-
-        heartbeat_task = asyncio.create_task(heartbeat())
-
-        # Основной цикл прослушивания Yahoo WS
-        # Мы используем wait_for, чтобы если Yahoo молчит 5 секунд (рынок закрыт),
-        # мы могли переключиться на ручное обновление.
-        while True:
-            try:
-                # Ждем сообщение от Yahoo 5 секунд
-                message = await asyncio.wait_for(iterator.__anext__(), timeout=5.0)
-                
-                if message and message.get('id'):
+            await aws.subscribe(ticker_list)
+            iterator = await aws.listen()
+            async for message in iterator:
+                if stop_event.is_set(): break
+                if message and 'id' in message:
                     sym = message['id']
-                    # Формируем легкий апдейт
-                    update = {
-                        sym: {
-                            "symbol": sym,
-                            "current_price": message.get('price'),
-                            "change_percent": message.get('changePercent'),
-                            "volume": message.get('dayVolume'),
-                            "source": "yahoo_streaming",
-                            "date": datetime.now(timezone.utc).isoformat()
-                        }
+                    # Сохраняем только нужные поля в наше состояние
+                    latest_data[sym] = {
+                        "symbol": sym,
+                        "current_price": message.get('price'),
+                        "change_percent": message.get('changePercent'),
+                        "volume": message.get('dayVolume'),
+                        "source": "live_stream",
+                        "date": datetime.now(timezone.utc).isoformat()
                     }
-                    if not await send_to_client(update): break
+        except Exception as e:
+            logger.error(f"Yahoo WS Listener Error: {e}")
+        finally:
+            stop_event.set()
 
-            except asyncio.TimeoutError:
-                # ШАГ 3: FALLBACK (Если данных от Yahoo WS нет — например, рынок закрыт или не US)
-                # Делаем ручной запрос раз в цикл тайм-аута
-                fallback_data = {}
+    # 2. ФУНКЦИЯ ПОЛЛИНГА (Для тикеров, которые не шлют данные по WS, например ESLT.TA)
+    async def poll_backup_api():
+        while not stop_event.is_set():
+            try:
                 for sym in ticker_list:
-                    q = get_combined_quote(sym)
-                    if q:
-                        q['source'] = 'api_polling'
-                        fallback_data[sym] = q
-                if not await send_to_client(fallback_data): break
+                    # Если данных по тикеру давно не было или это не-US рынок
+                    # мы принудительно обновляем его через быстрый fast_info
+                    data = get_combined_quote(sym)
+                    if data:
+                        data['source'] = 'api_refresh'
+                        latest_data[sym] = data
+                # Опрашиваем раз в 5 секунд (для крипты и акций этого за глаза)
+                await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"Polling Error: {e}")
+                await asyncio.sleep(2)
 
-    except WebSocketDisconnect:
-        logger.info(f"Client disconnected: {tickers}")
-    except Exception as e:
-        logger.error(f"WebSocket Loop Error: {e}")
+    # 3. ФУНКЦИЯ ОТПРАВКИ КЛИЕНТУ (Broadcaster)
+    async def broadcaster():
+        last_sent_hash = None
+        while not stop_event.is_set():
+            try:
+                if latest_data:
+                    # Проверяем, изменилось ли что-то, чтобы не слать дубли
+                    current_payload = clean_for_json(latest_data)
+                    
+                    # Отправляем данные клиенту
+                    await websocket.send_json(current_payload)
+                    
+                    # Очень важно: даем циклу событий отправить данные в TCP-стек
+                    await asyncio.sleep(0.5) 
+                else:
+                    await asyncio.sleep(1)
+            except (WebSocketDisconnect, ConnectionClosedError):
+                stop_event.set()
+                break
+            except Exception as e:
+                logger.error(f"Broadcaster Error: {e}")
+                stop_event.set()
+                break
+
+    # ЗАПУСК ВСЕХ ЗАДАЧ ПАРАЛЛЕЛЬНО
+    # Сначала шлем стартовый пакет
+    initial_snapshot = {}
+    for s in ticker_list:
+        initial_snapshot[s] = get_combined_quote(s)
+    await websocket.send_json(clean_for_json(initial_snapshot))
+
+    # Запускаем задачи
+    tasks = [
+        asyncio.create_task(listen_yahoo_ws()),
+        asyncio.create_task(poll_backup_api()),
+        asyncio.create_task(broadcaster())
+    ]
+
+    try:
+        # Ждем, пока кто-то из них не упадет или не сработает стоп-ивент
+        await stop_event.wait()
     finally:
-        # Очистка при закрытии
-        if 'heartbeat_task' in locals():
-            heartbeat_task.cancel()
-        logger.info(f"Connection closed for {tickers}")
+        stop_event.set()
+        for t in tasks:
+            t.cancel()
+        # Ждем завершения задач
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info(f"WebSocket closed for {tickers}")
             
             
 
