@@ -12,8 +12,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from yfinance import AsyncWebSocket
 from websockets.exceptions import ConnectionClosedError
 
-# ПРОВЕРКА ВЕРСИИ ПРИ ЗАПУСКЕ
-logger.info(f"🚀 YFINANCE VERSION INSTALLED: {yf.__version__}")
 
 # --- НАСТРОЙКА ЛОГОВ ---
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +19,11 @@ logger = logging.getLogger("PRO_LEAD")
 
 app = FastAPI(title="YFinance Enterprise Streamer v3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"])
+
+
+# ПРОВЕРКА ВЕРСИИ ПРИ ЗАПУСКЕ
+logger.info(f"🚀 YFINANCE VERSION INSTALLED: {yf.__version__}")
+
 
 app = FastAPI(
     title="YFinance Ultimate API", 
