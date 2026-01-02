@@ -70,7 +70,7 @@ EXCHANGE_MAP = {
 def clean_val(val):
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return None
-    return float(val) if isinstance(val, (float, np.floating)) else val
+    return float(val)
     
 
 def safe_get(obj, attr, default=None):
@@ -228,107 +228,97 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     await websocket.accept()
     symbols = [s.strip().upper() for s in tickers.split(",")]
     
-    state: Dict[str, Any] = {}
+    # Общий объект состояния для этого коннекта
+    state = {s: {"symbol": s, "source": "waiting"} for s in symbols}
     stop_event = asyncio.Event()
 
-    async def safe_update_ticker(symbol: str, is_init=False):
-        """Универсальный и безопасный метод получения данных."""
+    async def update_state(symbol: str, price: float, change_pct: float, source: str, market_stage=None):
+        """Централизованное обновление стейта с валидацией."""
+        if price is None: return
+        
+        # Если это акция Израиля, и пришла цена - значит рынок открыт, 
+        # даже если Yahoo говорит CLOSED
+        if ".TA" in symbol and market_stage == "CLOSED":
+            market_stage = "REGULAR (TASE ACTIVE)"
+
+        state[symbol].update({
+            "current_price": price,
+            "change_percent": round(change_pct, 2) if change_pct else 0.0,
+            "source": source,
+            "market_stage": market_stage or state[symbol].get("market_stage", "UNKNOWN"),
+            "trade_date": datetime.now(timezone.utc).isoformat()
+        })
+
+    async def fetch_snapshot(symbol: str, is_init=False):
+        """Получение данных через HTTP API."""
         try:
             t = yf.Ticker(symbol)
+            info = t.info
             
-            # Для валют (=X) fast_info почти всегда бесполезен или вызывает 404
-            is_forex = "=X" in symbol or symbol.endswith("=X")
+            # Пытаемся достать цену из разных полей (Yahoo иногда их меняет)
+            price = clean_val(info.get('currentPrice') or info.get('regularMarketPrice') or info.get('ask'))
+            prev_close = clean_val(info.get('previousClose'))
             
-            price, prev_close, m_stage = None, None, "UNKNOWN"
-            
-            if is_forex:
-                # Специальный метод для Forex
-                hist = t.history(period="1d")
-                if not hist.empty:
-                    price = clean_val(hist['Close'].iloc[-1])
-                    prev_close = clean_val(t.info.get('previousClose'))
-                m_stage = "REGULAR" # Forex почти всегда активен
-            else:
-                # Для акций пытаемся использовать быстрый метод
-                try:
-                    f = t.fast_info
-                    price = clean_val(f.last_price)
-                    prev_close = clean_val(f.previous_close)
-                    m_stage = t.info.get('marketState', 'UNKNOWN')
-                except:
-                    # Если fast_info подвел, берем из info
-                    info = t.info
-                    price = clean_val(info.get('currentPrice') or info.get('regularMarketPrice'))
-                    prev_close = clean_val(info.get('previousClose'))
-                    m_stage = info.get('marketState', 'UNKNOWN')
+            # Для Forex берем историю, если info пустой
+            if price is None and "=X" in symbol:
+                h = t.history(period="1d")
+                if not h.empty:
+                    price = clean_val(h['Close'].iloc[-1])
 
             change_pct = 0.0
             if price and prev_close:
-                change_pct = round(((price - prev_close) / prev_close) * 100, 2)
+                change_pct = ((price - prev_close) / prev_close) * 100
 
-            state[symbol] = {
-                "symbol": symbol,
-                "current_price": price,
-                "change_percent": change_pct,
-                "previous_close": prev_close,
-                "market_stage": m_stage,
-                "trade_date": datetime.now(timezone.utc).isoformat(),
-                "source": "init" if is_init else "api_refresh"
-            }
+            await update_state(
+                symbol, price, change_pct, 
+                "init" if is_init else "api_poll",
+                info.get('marketState')
+            )
         except Exception as e:
-            logger.warning(f"Failed to update {symbol}: {e}")
+            logger.error(f"Error fetching {symbol}: {e}")
 
-    async def yahoo_ws_task():
-        """Живой поток. Если для тикера нет обновлений (как для Forex в выходные), он просто молчит."""
+    async def stream_task():
+        """Поток живых данных из WebSocket."""
         while not stop_event.is_set():
             try:
                 aws = AsyncWebSocket()
                 await aws.subscribe(symbols)
-                iterator = await aws.listen()
-                if iterator:
-                    async for msg in iterator:
-                        if stop_event.is_set(): break
-                        sym = msg.get('id')
-                        if sym and sym in state:
-                            state[sym].update({
-                                "current_price": clean_val(msg.get('price', state[sym]["current_price"])),
-                                "change_percent": round(msg.get('changePercent', state[sym]["change_percent"]), 2),
-                                "source": "live_stream",
-                                "trade_date": datetime.now(timezone.utc).isoformat()
-                            })
+                # Важно: listen() должен быть внутри async for
+                async for msg in await aws.listen():
+                    if stop_event.is_set(): break
+                    
+                    sym = msg.get('id')
+                    if sym in state:
+                        # Логируем в консоль сервера, чтобы видеть живой приход
+                        logger.info(f"WS TICK -> {sym}: {msg.get('price')}")
+                        
+                        await update_state(
+                            sym, 
+                            clean_val(msg.get('price')), 
+                            clean_val(msg.get('changePercent')), 
+                            "live_stream"
+                        )
             except Exception as e:
-                logger.error(f"WS Error: {e}")
-                await asyncio.sleep(10)
+                logger.warning(f"Stream interrupted: {e}. Reconnecting...")
+                await asyncio.sleep(5)
 
-    async def polling_task():
-        """Фоновый апдейт для тех, кто не шлет данные в сокет (Forex/Выходные)."""
-        while not stop_event.is_set():
-            await asyncio.sleep(30) # Не частим, чтобы не получить 404
-            for sym in symbols:
-                if stop_event.is_set(): break
-                await safe_update_ticker(sym)
-                await asyncio.sleep(1)
+    # 1. Сразу загружаем начальные данные
+    await asyncio.gather(*[fetch_snapshot(s, is_init=True) for s in symbols])
 
-    # --- ЗАПУСК ---
-    # 1. Инициализация (ждем её, чтобы клиент сразу получил хоть что-то)
-    init_tasks = [safe_update_ticker(s, is_init=True) for s in symbols]
-    await asyncio.gather(*init_tasks)
-
-    # 2. Потоки
-    ws_t = asyncio.create_task(yahoo_ws_task())
-    poll_t = asyncio.create_task(polling_task())
-
+    # 2. Запускаем фоновые задачи
+    st_task = asyncio.create_task(stream_task())
+    
+    # 3. Цикл отправки данных клиенту
     try:
         while not stop_event.is_set():
-            if state:
-                await websocket.send_text(json.dumps(state))
+            # Отправляем копию стейта раз в секунду
+            await websocket.send_json(state)
             await asyncio.sleep(1)
-    except (WebSocketDisconnect):
-        logger.info("Client disconnected")
+    except WebSocketDisconnect:
+        logger.info("Client left.")
     finally:
         stop_event.set()
-        ws_t.cancel()
-        poll_t.cancel()
+        st_task.cancel()
             
 
 
