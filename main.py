@@ -418,34 +418,44 @@ def get_history(
 
 # --- УТИЛИТЫ ---
 @app.get("/search", tags=["Utility"])
-def search_ticker(query: str = Query(..., description="Название компании или тикер", example="Apple")):
+def search_ticker(
+    query: str = Query(..., description="Название компании или тикер", example="Apple"),
+    limit: int = Query(25, description="Максимальное количество результатов", ge=1, le=100)
+):
     """
     **Умный поиск активов.**
     
-    Возвращает до 15 наиболее релевантных результатов. Приоритет отдается тикерам, начинающимся на поисковый запрос.
+    Возвращает до 25 наиболее релевантных результатов (настраивается параметром limit, по умолчанию limit=25).
+    Приоритет отдается тикерам, начинающимся на поисковый запрос.
     
-    URL: /search?query=aap
+    URL: /search?query=aap&limit=25
     """
     try:
         q = query.strip().upper()
-        s = yf.Search(q, max_results=15)        
+        
+        # Запрашиваем данные у Yahoo Finance с запасом, 
+        # так как yfinance иногда фильтрует результаты внутри себя
+        s = yf.Search(q, max_results=limit)        
         quotes = s.quotes
+        
         if not quotes:
             return {"results": []}
 
-        # Сортировка: 
+        # Логика сортировки (как в вашем втором примере):
         # 1. Сначала те, чей тикер начинается ровно на запрос
-        # 2. Внутри групп - по весу (score)
+        # 2. Внутри групп - по весу (score), если он есть
         sorted_quotes = sorted(
             quotes, 
             key=lambda x: (
-                not x.get('symbol', '').startswith(q), 
+                not str(x.get('symbol', '')).upper().startswith(q), 
                 -x.get('score', 0)
             )
         )
 
-        # Возвращаем максимум 15, если пришло больше
-        return {"results": normalize_value(sorted_quotes[:15])}
+        # Возвращаем срез согласно лимиту
+        final_results = sorted_quotes[:limit]
+        
+        return {"results": normalize_value(final_results)}
         
     except Exception as e:
         logger.error(f"Search error for '{query}': {e}")
