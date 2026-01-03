@@ -467,12 +467,25 @@ def get_info(ticker: str):
 @app.get("/financials/{ticker}", tags=["Financial Data"])
 def get_financials(ticker: str):
     """**Финансовая отчетность.** Income Statement, Balance Sheet и Cash Flow."""
-    t = yf.Ticker(ticker.upper())
-    return normalize_value({
-        "income": t.income_stmt, 
-        "balance": t.balance_sheet, 
-        "cash": t.cashflow
-    })
+    try:
+        t = yf.Ticker(ticker)
+        
+        # Получаем данные и сразу конвертируем в словари, если они не пустые
+        income = t.income_stmt
+        balance = t.balance_sheet
+        cash = t.cashflow
+        
+        data = {
+            "income_statement": income.to_dict() if not income.empty else {},
+            "balance_sheet": balance.to_dict() if not balance.empty else {},
+            "cashflow": cash.to_dict() if not cash.empty else {}
+        }
+        
+        # Прогоняем через вашу функцию очистки для безопасности
+        return normalize_value(data)
+    except Exception as e:
+        logger.error(f"Financials error for {ticker}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching financials: {str(e)}")
 
 
 # --- КОРПОРАТИВНЫЕ СОБЫТИЯ ---
