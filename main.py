@@ -283,22 +283,20 @@ async def websocket_price(websocket: WebSocket, tickers: str):
         """Поток живых данных из WebSocket."""
         while not stop_event.is_set():
             try:
-                # 1. Создаем объект без await
                 aws = AsyncWebSocket() 
-                # 2. Подписываемся
                 await aws.subscribe(symbols)
                 
-                # 3. УБИРАЕМ await перед aws.listen()
-                # listen() возвращает итератор, по которому мы идем через async for
-                async for msg in aws.listen():
+                # Сначала дожидаемся вызова listen, получаем итератор
+                listener = await aws.listen() 
+                
+                # А теперь проходим по нему циклом
+                async for msg in listener:
                     if stop_event.is_set(): 
                         break
                     
                     sym = msg.get('id')
                     if sym in state:
-                        # Логируем, чтобы видеть активность в консоли
                         logger.info(f"WS TICK -> {sym}: {msg.get('price')}")
-                        
                         await update_state(
                             sym, 
                             clean_val(msg.get('price')), 
