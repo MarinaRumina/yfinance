@@ -27,8 +27,6 @@ app = FastAPI(
     version="2.1.2",
     description="Professional API for Yahoo Finance. Fixed WebSocket streaming for real-time client visibility."
 )
-app.add_middleware(CORSMiddleware, allow_origins=["*"])
-
 
 # ПРОВЕРКА ВЕРСИИ ПРИ ЗАПУСКЕ
 logger.info(f"🚀 YFINANCE VERSION INSTALLED: {yf.__version__}")
@@ -285,15 +283,20 @@ async def websocket_price(websocket: WebSocket, tickers: str):
         """Поток живых данных из WebSocket."""
         while not stop_event.is_set():
             try:
-                aws = AsyncWebSocket()
+                # 1. Создаем объект без await
+                aws = AsyncWebSocket() 
+                # 2. Подписываемся
                 await aws.subscribe(symbols)
-                # Важно: listen() должен быть внутри async for
-                async for msg in await aws.listen():
-                    if stop_event.is_set(): break
+                
+                # 3. УБИРАЕМ await перед aws.listen()
+                # listen() возвращает итератор, по которому мы идем через async for
+                async for msg in aws.listen():
+                    if stop_event.is_set(): 
+                        break
                     
                     sym = msg.get('id')
                     if sym in state:
-                        # Логируем в консоль сервера, чтобы видеть живой приход
+                        # Логируем, чтобы видеть активность в консоли
                         logger.info(f"WS TICK -> {sym}: {msg.get('price')}")
                         
                         await update_state(
@@ -303,7 +306,7 @@ async def websocket_price(websocket: WebSocket, tickers: str):
                             "live_stream"
                         )
             except Exception as e:
-                logger.warning(f"Stream interrupted: {e}. Reconnecting...")
+                logger.warning(f"Stream interrupted: {e}. Reconnecting in 5s...")
                 await asyncio.sleep(5)
 
     # 1. Сразу загружаем начальные данные
@@ -316,7 +319,7 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     try:
         while not stop_event.is_set():
             # Отправляем копию стейта раз в секунду
-            await websocket.send_json(state)
+            await websocket.send_json(clean_for_json(state))
             await asyncio.sleep(1)
     except WebSocketDisconnect:
         logger.info("Client left.")
