@@ -13,7 +13,7 @@ from yfinance import AsyncWebSocket
 from websockets.exceptions import ConnectionClosedError
 
 
-# --- НАСТРОЙКА ЛОГОВ ---
+# --- НАСТРОЙКА ЛОГОВ ----
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PRO_LEAD_STREAMER")
 
