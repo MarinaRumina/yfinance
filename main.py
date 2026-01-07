@@ -17,19 +17,22 @@ from websockets.exceptions import ConnectionClosedError
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PRO_LEAD_STREAMER")
 
-app = FastAPI()
+# Читаем путь из переменной окружения. 
+root_path = os.getenv("ROOT_PATH", "")
+
+# Создаем приложение ОДИН РАЗ со всеми параметрами сразу
+app = FastAPI(
+    root_path=root_path,
+    title="YFinance Ultimate API", 
+    version="2.1.2",
+    description="Professional API for Yahoo Finance. Fixed WebSocket streaming for real-time client visibility."
+)
 app.add_middleware(CORSMiddleware, allow_origins=["*"])
 
 
 # ПРОВЕРКА ВЕРСИИ ПРИ ЗАПУСКЕ
 logger.info(f"🚀 YFINANCE VERSION INSTALLED: {yf.__version__}")
 
-
-app = FastAPI(
-    title="YFinance Ultimate API", 
-    version="2.1.2",
-    description="Professional API for Yahoo Finance. Fixed WebSocket streaming for real-time client visibility."
-)
 
 app.add_middleware(
     CORSMiddleware, 
