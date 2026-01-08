@@ -297,32 +297,50 @@ async def websocket_price(websocket: WebSocket, tickers: str):
             logger.error(f"Error fetching {symbol}: {e}")
 
     async def stream_task():
-        """Поток живых данных из WebSocket."""
+        """Поток живых данных из WebSocket (Robust Version)."""
         while not stop_event.is_set():
             try:
+                logger.info("Connecting to Yahoo WebSocket...")
                 aws = AsyncWebSocket() 
                 await aws.subscribe(symbols)
                 
-                # Сначала дожидаемся вызова listen, получаем итератор
-                listener = await aws.listen() 
+                # 1. Получаем объект от listen()
+                listener = aws.listen()
                 
-                # А теперь проходим по нему циклом
+                # 2. Если это корутина (на некоторых версиях), ждем её
+                if asyncio.iscoroutine(listener):
+                    listener = await listener
+                
+                # 3. КРИТИЧЕСКАЯ ПРОВЕРКА: Если вернулся None, значит соединение не удалось
+                if listener is None:
+                    logger.warning("Yahoo returned None instead of stream. Retrying in 2s...")
+                    await asyncio.sleep(2)
+                    continue
+
+                logger.info("Stream established. Waiting for data...")
+                
+                # 4. Безопасный цикл
                 async for msg in listener:
                     if stop_event.is_set(): 
                         break
                     
                     sym = msg.get('id')
                     if sym in state:
-                        logger.info(f"WS TICK -> {sym}: {msg.get('price')}")
+                        # Лог для отладки - показывает живые данные
+                        logger.info(f"⚡ TICK: {sym} -> {msg.get('price')}")
+                        
                         await update_state(
                             sym, 
                             clean_val(msg.get('price')), 
                             clean_val(msg.get('changePercent')), 
                             "live_stream"
                         )
+                        
             except Exception as e:
-                logger.warning(f"Stream interrupted: {e}. Reconnecting in 5s...")
+                # Ловим любые ошибки, чтобы поток не умер
+                logger.error(f"Stream error: {str(e)}. Reconnecting in 5s...")
                 await asyncio.sleep(5)
+                
 
     # 1. Сразу загружаем начальные данные
     await asyncio.gather(*[fetch_snapshot(s, is_init=True) for s in symbols])
@@ -333,11 +351,14 @@ async def websocket_price(websocket: WebSocket, tickers: str):
     # 3. Цикл отправки данных клиенту
     try:
         while not stop_event.is_set():
-            # Отправляем копию стейта раз в секунду
-            await websocket.send_json(clean_for_json(state))
+            # ВАЖНО: clean_for_json убирает NaN и бесконечности, из-за которых падает сокет
+            safe_state = clean_for_json(state)
+            await websocket.send_json(safe_state)
             await asyncio.sleep(1)
     except WebSocketDisconnect:
-        logger.info("Client left.")
+        logger.info("Client left (Disconnect).")
+    except Exception as e:
+        logger.error(f"Error sending data to client: {e}")
     finally:
         stop_event.set()
         st_task.cancel()
