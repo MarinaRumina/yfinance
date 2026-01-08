@@ -224,6 +224,23 @@ def get_multiple_quotes(
 
 
 # --- ОБНОВЛЕННЫЙ ВЕБСОКЕТ С РАЗДЕЛЕНИЕМ ПОТОКОВ ---
+# test wevsocket
+@app.websocket("/ws/quote/{symbols}")
+async def websocket_endpoint(websocket: WebSocket, symbols: str):
+    await websocket.accept()
+    try:
+        # Убедитесь, что эта функция (generator) точно возвращает асинхронный итератор
+        stream = get_yfinance_stream(symbols.split(',')) 
+        if stream is None:
+            await websocket.send_json({"error": "Could not create stream"})
+            return
+            
+        async for data in stream:
+            await websocket.send_json(data)
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        await websocket.close()
 
 @app.websocket("/ws/price/{tickers}")
 async def websocket_price(websocket: WebSocket, tickers: str):
