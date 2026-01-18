@@ -372,8 +372,9 @@ async def websocket_price(websocket: WebSocket, tickers: str):
 def get_multiple_histories(
     symbols: str = Query(
         ..., 
-        description="Ticker symbols separated by commas (1-20 alphanumeric, may include . or -)", 
-        example="AAPL,TSLA,TEVA.TA"
+        description="Ticker symbols separated by commas (1-20 alphanumeric, may include . - ^ =)",
+        pattern="^[A-Za-z0-9\\.\\^=-]{1,20}$", # Это ограничение на ввод
+        example="AAPL,^GSPC,ILS=X,TEVA.TA"
     ), 
     period: Optional[str] = Query("1mo", description="Период данных (1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max)"), 
     interval: str = Query("1d", description="Интервал свечи (1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo)"),
@@ -429,9 +430,10 @@ def get_multiple_histories(
 def get_history(
     ticker: str = Path(
         ..., 
-        description="Ticker symbol (1-20 alphanumeric, may include . or -)", 
-        pattern="^[A-Za-z0-9\\.-]{1,20}$", # Это ограничение на ввод
-        example="AAPL"
+        description="Ticker symbol (1-20 alphanumeric, may include . - ^ =)", 
+        # Добавили \\^ и = перед дефисом
+        pattern="^[A-Za-z0-9\\.\\^=-]{1,20}$", # Это ограничение на ввод
+        example="AAPL,^GSPC,ILS=X"
     ),
     period: str = Query("1mo", description="Data period (e.g., 1mo, 1y, max). Available periods: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max."),
     interval: str = Query("1d", description="Data aggregation interval (candle size, e.g., 1h, 1d, 1wk). Available intervals: 1m, 2m, 5m, 15m, 30m, 60m, 90m, 1h, 1d, 5d, 1wk, 1mo, 3mo."),
