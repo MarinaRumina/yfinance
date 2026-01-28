@@ -508,7 +508,7 @@ def search_ticker(
 
 
 @app.get("/isin/{ticker}", tags=["Utility"])
-def get_info(ticker: str):
+def get_isin(ticker: str):
     """
     **Получение ISIN**
     
