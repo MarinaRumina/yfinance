@@ -507,6 +507,18 @@ def search_ticker(
         raise HTTPException(status_code=500, detail="Search failed")
 
 
+@app.get("/isin/{ticker}", tags=["Utility"])
+def get_info(ticker: str):
+    """
+    **Получение ISIN**
+    
+    URL: /isin/aapl
+    """
+    t = yf.Ticker(ticker.upper())
+    return normalize_value(t.info)
+
+
+
 @app.get("/info/{ticker}", tags=["Full Data"])
 def get_info(ticker: str):
     """
