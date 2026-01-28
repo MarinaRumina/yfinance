@@ -518,6 +518,17 @@ def get_info(ticker: str):
     return normalize_value(t.info)
 
 
+@app.get("/fastinfo/{ticker}", tags=["Full Data"])
+def get_fast_info(ticker: str):
+    """
+    **Быстрая информация.** 
+    
+    URL: /fastinfo/aapl
+    """
+    t = yf.Ticker(ticker.upper())
+    return normalize_value(t.info)
+
+
 # --- ФИНАНСОВЫЕ ДАННЫЕ ---
 @app.get("/financials/{ticker}", tags=["Financial Data"])
 def get_financials(ticker: str):
