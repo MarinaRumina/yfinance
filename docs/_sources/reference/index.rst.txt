@@ -15,7 +15,7 @@ The following are the publicly available classes, and functions exposed by the `
 
 - :attr:`Ticker <yfinance.Ticker>`: Class for accessing single ticker data.
 - :attr:`Tickers <yfinance.Tickers>`: Class for handling multiple tickers.
-- :attr:`Market <yfinance.Market>`: Class for accessing market summary.
+- :doc:`Market <yfinance.market>`: Class for accessing market summary.
 - :attr:`Calendars <yfinance.Calendars>`: Class for accessing calendar events data.
 - :attr:`download <yfinance.download>`: Function to download market data for multiple tickers.
 - :attr:`Search <yfinance.Search>`: Class for accessing search results.
@@ -26,6 +26,7 @@ The following are the publicly available classes, and functions exposed by the `
 - :attr:`Industry <yfinance.Industry>`: Domain class for accessing industry information.
 - :attr:`EquityQuery <yfinance.EquityQuery>`: Class to build equity query filters.
 - :attr:`FundQuery <yfinance.FundQuery>`: Class to build fund query filters.
+- :attr:`ETFQuery <yfinance.ETFQuery>`: Class to build ETF query filters.
 - :attr:`screen <yfinance.screen>`: Run equity/fund queries.
 - :attr:`config.debug.logging <yfinance.config>`: Enable verbose debug logging (``yf.config.debug.logging = True``).
 - :attr:`set_tz_cache_location <yfinance.set_tz_cache_location>`: Function to set the timezone cache location.
