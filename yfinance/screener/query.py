@@ -1,16 +1,19 @@
 from abc import ABC, abstractmethod
 import numbers
-from typing import List, Union, Dict, TypeVar, Tuple
+from typing import List, Union, Dict, TypeVar, Literal
 
 from yfinance.const import EQUITY_SCREENER_EQ_MAP, EQUITY_SCREENER_FIELDS
 from yfinance.const import FUND_SCREENER_EQ_MAP, FUND_SCREENER_FIELDS
+from yfinance.const import ETF_SCREENER_EQ_MAP, ETF_SCREENER_FIELDS
 from yfinance.exceptions import YFNotImplementedError
 from ..utils import dynamic_docstring, generate_list_table_from_dict_universal
 
 T = TypeVar('T', bound=Union[str, numbers.Real])
 
+Operator = Literal['eq', 'is-in', 'btwn', 'gt', 'lt', 'gte', 'lte', 'and', 'or']
+
 class QueryBase(ABC):
-    def __init__(self, operator: str, operand: Union[ List['QueryBase'], Tuple[str, Tuple[Union[str, numbers.Real],  ...]] ]):
+    def __init__(self, operator: Operator, operand: Union[ List['QueryBase'], List[str], List[numbers.Real] ]):
         operator = operator.upper()
 
         if not isinstance(operand, list):
@@ -36,7 +39,7 @@ class QueryBase(ABC):
 
     @property
     @abstractmethod
-    def valid_fields(self) -> List:
+    def valid_fields(self) -> Dict:
         raise YFNotImplementedError('valid_fields() needs to be implemented by child')
 
     @property
@@ -216,3 +219,41 @@ class FundQuery(QueryBase):
         """
         return FUND_SCREENER_EQ_MAP
 
+class ETFQuery(QueryBase):
+    """
+    The `ETFQuery` class constructs filters for ETFs based on specific criteria such as category, fund family, exchange, and performance ratings.
+
+    Start with value operations: `EQ` (equals), `IS-IN` (is in), `BTWN` (between), `GT` (greater than), `LT` (less than), `GTE` (greater or equal), `LTE` (less or equal).
+
+    Combine them with logical operations: `AND`, `OR`.
+
+    Example:
+        Predefined Yahoo query `top_etfs_us`:
+        
+        .. code-block:: python
+
+            from yfinance import ETFQuery
+
+            ETFQuery('and', [
+                ETFQuery('gt', ['intradayprice', 10]),
+                ETFQuery('is-in', ['performanceratingoverall', 4, 5]),
+                ETFQuery('eq', ['region', 'us'])
+            ])
+    """
+    @dynamic_docstring({"valid_operand_fields_table": generate_list_table_from_dict_universal(ETF_SCREENER_FIELDS)})
+    @property
+    def valid_fields(self) -> Dict:
+        """
+        Valid operands, grouped by category.
+        {valid_operand_fields_table}
+        """
+        return ETF_SCREENER_FIELDS
+    
+    @dynamic_docstring({"valid_values_table": generate_list_table_from_dict_universal(ETF_SCREENER_EQ_MAP)})
+    @property
+    def valid_values(self) -> Dict:
+        """
+        Most operands take number values, but some have a restricted set of valid values.
+        {valid_values_table}
+        """
+        return ETF_SCREENER_EQ_MAP
