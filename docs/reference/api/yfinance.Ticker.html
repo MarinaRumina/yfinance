@@ -446,6 +446,10 @@ document.write(`
 <li class="toctree-l2"><a class="reference internal" href="yfinance.screen.html">yfinance.screen</a></li>
 </ul>
 </details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../yfinance.auth.html">Authentication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="yfinance.Auth.html">Auth</a></li>
+</ul>
+</details></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../yfinance.functions.html">Functions and Utilities</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l2"><a class="reference internal" href="yfinance.download.html">yfinance.download</a></li>
 <li class="toctree-l2"><a class="reference internal" href="yfinance.enable_debug_mode.html">yfinance.enable_debug_mode</a></li>
@@ -972,8 +976,11 @@ Columns:    stock  industry  sector  index</p>
 
 <dl class="py method">
 <dt class="sig sig-object py">
-<span class="sig-name descname"><span class="pre">get_history_metadata</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">dict</span></span></span></dt>
-<dd></dd></dl>
+<span class="sig-name descname"><span class="pre">get_history_metadata</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">repair=&lt;object</span> <span class="pre">object&gt;</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">dict</span></span></span></dt>
+<dd><p>repair default value depends on whether user requested price repair
+with previous history() call. If user did not set repair here, then
+it is set to match previous history() call.</p>
+</dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py">
@@ -1100,8 +1107,28 @@ Columns: firm toGrade fromGrade action</p>
 
 <dl class="py method">
 <dt class="sig sig-object py">
-<span class="sig-name descname"><span class="pre">get_valuation_measures</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span></dt>
-<dd></dd></dl>
+<span class="sig-name descname"><span class="pre">get_valuation_measures</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">freq</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'quarterly'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">periods</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">5</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">DataFrame</span></span></span></dt>
+<dd><p>Valuation measures (market cap, P/E, P/S, P/B, EV/EBITDA, …).</p>
+<p>Returns a DataFrame with the 9 valuation measures as rows and a
+<code class="docutils literal notranslate"><span class="pre">Current</span></code> column plus period-end date columns (newest first). Values
+are raw numeric measures (floats, with <code class="docutils literal notranslate"><span class="pre">NaN</span></code> for missing cells); the
+date column labels remain <code class="docutils literal notranslate"><span class="pre">&quot;M/D/YYYY&quot;</span></code> strings.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>freq</strong> – period columns to return — “quarterly” (default), “monthly”,
+“yearly” or “trailing”. The “Current” column always reflects the
+latest trailing value.</p></li>
+<li><p><strong>periods</strong> – cap on the number of period (date) columns returned, newest
+first. An int &gt;= 0 or None. The default of 5 matches the column
+count the old key-statistics page showed; <code class="docutils literal notranslate"><span class="pre">periods=0</span></code> returns
+only the “Current” column; <code class="docutils literal notranslate"><span class="pre">None</span></code> returns all available history.
+The <code class="docutils literal notranslate"><span class="pre">valuation</span></code> property uses this default — call the method
+form to control <code class="docutils literal notranslate"><span class="pre">periods</span></code>.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py">
