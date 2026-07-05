@@ -1,6 +1,54 @@
 Change Log
 ===========
 
+1.5.1
+-----
+Minor
+- Fall back to chunked requests when single-URL fundamentals fetch times out #2811
+- Replace valuation-measures HTML scrape with timeseries API #2851
+Patches
+- Determine login and subscription tier via the subscriptions API #2845
+- Preserve user login cookies across cookie-strategy switches #2850
+- Normalize configured proxy strings #2853
+- Fix 404 Developer Guide link in CONTRIBUTING.md #2852
+- Fix typo in CONTRIBUTING.md: "updates" -> "update" #2858
+- Complementary info: guard against empty or malformed timeseries #2863
+- Fix missing comma splitting two equity screener EPS fields #2867
+- Fix _fetch_info handling of None responses #2869
+- Complementary info: guard against empty or missing timeseries result #2877
+Patches - price repair
+- Fix price-repair unit-switch sometimes applying twice #2842
+- Handle premarket silly games creating false-positive bad-dividend #2843
+- Price repair: fix error triggered by NaN volume #2859
+- Dividend repair: handle 'Adj Close' going to infinity #2860
+
+1.4.1
+-----
+Fix
+- Preserve Date/Datetime index name in yf.download() output #2832
+
+1.4.0
+-----
+Features
+- Add Auth class for Logging In #2761
+- Allow region scoping for Sector and Industry (closes #2601) #2803
+- Make curl_cffi optional with fallback to requests (closes #2692) #2802
+Fixes
+- Add 'repair' to get_history_metadata() #2777
+- Adding try block for added protection to "meta" data #2778
+- Fix: _dts_in_same_interval("1mo") ignored year #2780
+- Fix TypeError when data['chart'] is None in history.py (#2670) #2794
+- Fix dividends error on unlisted tickers #2797
+- Fix #2784: validate Market region and stop returning misleading status #2801
+- Make yf.download() reentrant by removing shared module globals #2805
+- Allow lang and region scoping for Ticker (closes #2582) #2804
+- Fix localized intraday download() always returning UTC #2825
+Maintenance
+- chore: fix typos (prividing -> providing, Reponse -> Response) #2779
+- Fix Failing Tests #2792
+- Simplify phantom-dividend repair branch + drive-by typo/lint fixes #2810
+- Drop frozendict hard dependency in favour of an internal fallback #2821
+
 1.3.0
 -----
 Features:

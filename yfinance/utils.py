@@ -35,6 +35,7 @@ import warnings
 
 import numpy as _np
 import pandas as _pd
+from pandas.api.types import is_float_dtype
 import pytz as _tz
 from dateutil.relativedelta import relativedelta
 from pytz import UnknownTimeZoneError
@@ -42,6 +43,34 @@ from pytz import UnknownTimeZoneError
 from yfinance import const
 from yfinance.exceptions import YFException
 from yfinance.config import YfConfig
+
+# Use the third-party ``frozendict`` package if installed; otherwise fall
+# back to a small pure-Python equivalent (PEP 814).
+try:
+    from frozendict import frozendict  # type: ignore[import-not-found]
+except ImportError:
+    class frozendict(dict):  # type: ignore[no-redef]
+        """Hashable, read-only ``dict`` used as an ``lru_cache`` key."""
+        __slots__ = ()
+
+        def __hash__(self):  # type: ignore[override]
+            return hash(frozenset(self.items()))
+
+        def __setitem__(self, *args, **kwargs):
+            raise TypeError(f"'{type(self).__name__}' object doesn't support item assignment")
+
+        def __delitem__(self, *args, **kwargs):
+            raise TypeError(f"'{type(self).__name__}' object doesn't support item deletion")
+
+        def _readonly(self, *args, **kwargs):
+            raise AttributeError(f"'{type(self).__name__}' object is read-only")
+
+        pop = _readonly  # type: ignore[assignment]
+        popitem = _readonly  # type: ignore[assignment]
+        clear = _readonly  # type: ignore[assignment]
+        update = _readonly  # type: ignore[assignment]
+        setdefault = _readonly  # type: ignore[assignment]
+
 
 # From https://stackoverflow.com/a/59128615
 def attributes(obj):
@@ -526,10 +555,12 @@ def parse_quotes(data):
                             "Close": closes,
                             "Adj Close": adjclose,
                             "Volume": volumes})
-
     quotes.index = _pd.to_datetime(timestamps, unit="s")
     quotes.sort_index(inplace=True)
-
+    for c in ['Open', 'High', 'Low', 'Close', 'Adj Close']:
+        if not is_float_dtype(quotes[c].dtype):
+            # Only seen when Adj Close contains Infinity.
+            quotes[c] = quotes[c].astype('float')
     return quotes
 
 
@@ -624,7 +655,7 @@ def _dts_in_same_interval(dt1, dt2, interval):
     elif interval == "1wk":
         last_rows_same_interval = (dt2 - dt1).days < 7
     elif interval == "1mo":
-        last_rows_same_interval = dt1.month == dt2.month
+        last_rows_same_interval = dt1.month == dt2.month and dt1.year == dt2.year
     elif interval == "3mo":
         shift = (dt1.month % 3) - 1
         q1 = (dt1.month - shift - 1) // 3 + 1

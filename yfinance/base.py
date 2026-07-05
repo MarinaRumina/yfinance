@@ -27,11 +27,11 @@ from urllib.parse import quote as urlencode
 
 import numpy as np
 import pandas as pd
-from curl_cffi import requests
+from ._http import requests, new_session
 
 
 from . import utils, cache
-from .const import _MIC_TO_YAHOO_SUFFIX
+from .const import _MIC_TO_YAHOO_SUFFIX, _SENTINEL_
 from .data import YfData
 from .config import YfConfig
 from .exceptions import YFDataException, YFEarningsDateMissing, YFRateLimitError
@@ -81,7 +81,7 @@ class TickerBase:
                 ticker = base_symbol
 
         self.ticker = ticker.upper()
-        self.session = session or requests.Session(impersonate="chrome")
+        self.session = session or new_session()
         self._tz = None
 
         self._isin = None
@@ -287,9 +287,26 @@ class TickerBase:
             self._fast_info = FastInfo(self)
         return self._fast_info
 
-    def get_valuation_measures(self):
-        data = self._quote.valuation_measures
-        return data
+    def get_valuation_measures(self, freq="quarterly", periods=5) -> pd.DataFrame:
+        """Valuation measures (market cap, P/E, P/S, P/B, EV/EBITDA, ...).
+
+        Returns a DataFrame with the 9 valuation measures as rows and a
+        ``Current`` column plus period-end date columns (newest first). Values
+        are raw numeric measures (floats, with ``NaN`` for missing cells); the
+        date column labels remain ``"M/D/YYYY"`` strings.
+
+        Args:
+            freq: period columns to return — "quarterly" (default), "monthly",
+                "yearly" or "trailing". The "Current" column always reflects the
+                latest trailing value.
+            periods: cap on the number of period (date) columns returned, newest
+                first. An int >= 0 or None. The default of 5 matches the column
+                count the old key-statistics page showed; ``periods=0`` returns
+                only the "Current" column; ``None`` returns all available history.
+                The ``valuation`` property uses this default — call the method
+                form to control ``periods``.
+        """
+        return self._quote.get_valuation_measures(freq, periods)
 
     def get_sustainability(self, as_dict=False):
         data = self._quote.sustainability
@@ -738,7 +755,7 @@ class TickerBase:
 
         # Fetch data
         url = f"{_QUERY1_URL_}/v1/finance/visualization"
-        params = {"lang": "en-US", "region": "US"}
+        params = {"lang": YfConfig.locale.lang, "region": YfConfig.locale.region}
         body = {
             "size": limit,
             "query": { "operator": "eq", "operands": ["ticker", self.ticker] },
@@ -789,8 +806,13 @@ class TickerBase:
         self._earnings_dates[limit] = df
         return df
 
-    def get_history_metadata(self) -> dict:
-        return self._lazy_load_price_history().get_history_metadata()
+    def get_history_metadata(self, repair=_SENTINEL_) -> dict:
+        """
+        repair default value depends on whether user requested price repair
+        with previous history() call. If user did not set repair here, then
+        it is set to match previous history() call.
+        """
+        return self._lazy_load_price_history().get_history_metadata(repair=repair)
 
     def get_funds_data(self) -> Optional[FundsData]:
         if not self._funds_data:

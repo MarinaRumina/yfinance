@@ -3,14 +3,13 @@ from functools import lru_cache
 import socket
 import time as _time
 
-from curl_cffi import requests
+from ._http import requests, new_session, is_supported_session, cookie_jar
 from urllib.parse import urlsplit, urljoin
 from bs4 import BeautifulSoup
 import datetime
 
-from frozendict import frozendict
-
 from . import utils, cache
+from .utils import frozendict
 from .config import YfConfig
 import threading
 
@@ -29,6 +28,12 @@ def _is_transient_error(exception):
     return error_type_name in transient_error_types
 
 cache_maxsize = 64
+
+
+def _normalize_proxy(proxy):
+    if isinstance(proxy, str):
+        return {"http": proxy, "https": proxy}
+    return proxy
 
 
 def lru_cache_freezeargs(func):
@@ -81,6 +86,11 @@ class YfData(metaclass=SingletonMeta):
     def __init__(self, session=None):
         self._crumb = None
         self._cookie = None
+        # Whether the user has supplied login cookies (see set_login_cookies).
+        # When logged in, the cookie-strategy toggle must not wipe the jar, or
+        # it would silently log the user out. Auth corrects this flag to reflect
+        # the real login state once it has been verified.
+        self._logged_in = False
 
         # Default to using 'basic' strategy
         self._cookie_strategy = 'basic'
@@ -89,8 +99,39 @@ class YfData(metaclass=SingletonMeta):
 
         self._cookie_lock = threading.Lock()
 
+        # Set to True after a single-URL fundamentals-timeseries fetch has
+        # failed (typically a silent drop on WSL2 NAT or restrictive corporate
+        # proxy). Sticky so a loop over tickers doesn't pay one timeout per
+        # ticker; reverted if the chunked fallback also fails.
+        self.fundamentals_use_chunked: bool = False
+
         self._session = None
-        self._set_session(session or requests.Session(impersonate="chrome"))
+        self._set_session(session or new_session())
+
+    def set_login_cookies(self, cookie_t, cookie_y):
+        with self._cookie_lock:
+            self._session.cookies.update({
+                "T": cookie_t,
+                "Y": cookie_y
+            })
+            self._cookie = True
+            # Optimistically mark as logged in so a transient 4xx during the
+            # initial login verification can't wipe these cookies. Auth.check_login
+            # corrects this to the real state right after.
+            self._logged_in = True
+            # Drop any cached crumb: it may have been minted under a different
+            # (e.g. anonymous, or another account's) login state. Forcing a
+            # re-mint on the next request keeps the crumb matched to these
+            # cookies, so the login takes effect cleanly mid-process.
+            self._crumb = None
+
+    def _set_logged_in(self, value):
+        """Thread-safe update of the login flag (also read under this lock in
+        _set_cookie_strategy). Auth calls this after verifying the real login
+        state, possibly from another thread, so the write must be serialized to
+        avoid a stale value clobbering a concurrent fresh login."""
+        with self._cookie_lock:
+            self._logged_in = value
 
     def _set_session(self, session):
         if session is None:
@@ -106,16 +147,17 @@ class YfData(metaclass=SingletonMeta):
             # Can't simply use a non-caching session to fetch cookie & crumb,
             # because then the caching-session won't have cookie.
             self._session_is_caching = True
-            # But since switch to curl_cffi, can't use requests_cache with it.
-            raise YFDataException("request_cache sessions don't work with curl_cffi, which is necessary now for Yahoo API. Solution: stop setting session, let YF handle.")
+            # requests_cache wraps the stdlib Session; it doesn't work with
+            # curl_cffi and tends to miss anyway because the Yahoo crumb rotates.
+            raise YFDataException("Caching sessions (e.g. requests_cache) are not supported. Solution: stop setting session, let yfinance handle.")
 
-        if not isinstance(session, requests.session.Session):
-            raise YFDataException(f"Yahoo API requires curl_cffi session not {type(session)}. Solution: stop setting session, let YF handle.")
+        if not is_supported_session(session):
+            raise YFDataException(f"Unsupported session type {type(session)}; expected curl_cffi or requests Session. Solution: stop setting session, let yfinance handle.")
 
         with self._cookie_lock:
             self._session = session
             if YfConfig.network.proxy is not None:
-                self._session.proxies = YfConfig.network.proxy
+                self._session.proxies = _normalize_proxy(YfConfig.network.proxy)
 
     def _set_cookie_strategy(self, strategy, have_lock=False):
         if strategy == self._cookie_strategy:
@@ -126,7 +168,12 @@ class YfData(metaclass=SingletonMeta):
         try:
             if self._cookie_strategy == 'csrf':
                 utils.get_yf_logger().debug(f'toggling cookie strategy {self._cookie_strategy} -> basic')
-                self._session.cookies.clear()
+                # Don't clear the jar while logged in: that would drop the
+                # user-set login cookies (T/Y) and silently log them out. The
+                # toggle still resets the anonymous cookie/crumb below, so the
+                # anonymous refresh path is unaffected.
+                if not self._logged_in:
+                    self._session.cookies.clear()
                 self._cookie_strategy = 'basic'
             else:
                 utils.get_yf_logger().debug(f'toggling cookie strategy {self._cookie_strategy} -> csrf')
@@ -144,7 +191,7 @@ class YfData(metaclass=SingletonMeta):
     def _save_cookie_curlCffi(self):
         if self._session is None:
             return False
-        cookies = self._session.cookies.jar._cookies
+        cookies = cookie_jar(self._session)._cookies
         if len(cookies) == 0:
             return False
         yh_domains = [k for k in cookies.keys() if 'yahoo' in k]
@@ -180,7 +227,7 @@ class YfData(metaclass=SingletonMeta):
         if expired:
             utils.get_yf_logger().debug('cached cookie expired')
             return False
-        self._session.cookies.jar._cookies.update(cookies)
+        cookie_jar(self._session)._cookies.update(cookies)
         self._cookie = cookie
         return True
 
@@ -399,7 +446,7 @@ class YfData(metaclass=SingletonMeta):
         utils.get_yf_logger().debug(f'params={params}')
 
         # sync with config
-        self._session.proxies = YfConfig.network.proxy
+        self._session.proxies = _normalize_proxy(YfConfig.network.proxy)
 
         if params is None:
             params = {}
@@ -492,7 +539,7 @@ class YfData(metaclass=SingletonMeta):
             timeout (int) : Raise TimeoutError if post doesn't respond
     
         Returns:
-            response (requests.Response) : Reponse instance received from the server after accepting cookie-consent post.
+            response (requests.Response) : Response instance received from the server after accepting cookie-consent post.
         """
         soup = BeautifulSoup(consent_resp.text, "html.parser")
     
@@ -542,3 +589,128 @@ class YfData(metaclass=SingletonMeta):
             action, data=data, headers=headers, timeout=timeout, allow_redirects=True
         )
         return response
+
+_SUBSCRIPTIONS_URL = "https://query1.finance.yahoo.com/ws/obi-integration/v1/subscriptions"
+
+# Yahoo Finance subscription tier ids. The subscriptions response reports the
+# account's tier as an integer in subscriptionView[].tier; tierRanking is
+# [3, 4, 5, 6] (there is no tier 1/2, and tier 4 is unmarketed). Reading the id
+# is more stable than inferring from granted features, which Yahoo reshuffles
+# between tiers for marketing reasons.
+_TIER_NAMES = {6: "gold", 5: "silver", 3: "bronze"}
+
+
+class Auth:
+    def __init__(self, session=None):
+        self._session = session
+        self._data = YfData(session)
+
+    def set_login_cookies(self, cookie_t: str, cookie_y: str) -> bool:
+        """
+        Set the login cookies and verify they are valid.
+
+        How to Obtain the Cookies:
+            1. Open your browser (e.g., Chrome, Firefox).
+            2. Log in to Yahoo Finance (https://finance.yahoo.com).
+            3. Open the browser's Developer Tools:
+               Press `F12` or `Ctrl + Shift + I` (Windows/Linux) or `Cmd + Option + I` (Mac).
+            4. Go to the "Application" tab (Chrome) or "Storage" tab (Firefox).
+            5. In the "Cookies" section, select `https://finance.yahoo.com`.
+            6. Look for the cookies named `T` and `Y`.
+            7. Copy the values of these cookies and pass them to this function.
+
+        Args:
+            cookie_t (str): The value for the 'T' cookie.
+            cookie_y (str): The value for the 'Y' cookie.
+
+        Returns:
+            bool: ``True`` if the cookies are valid (the account is logged in),
+            ``False`` otherwise (also emitted as a warning). The cookies are
+            stored regardless. ``False`` can also mean Yahoo was transiently
+            unreachable, so it is not treated as a hard error.
+        """
+        self._data.set_login_cookies(cookie_t, cookie_y)
+        logged_in = self.check_login()
+        if not logged_in:
+            utils.get_yf_logger().warning(
+                "set_login_cookies: the provided cookies are not logged in "
+                "(or Yahoo is unreachable)."
+            )
+        return logged_in
+
+    def _fetch_entitlement(self) -> dict | None:
+        """Fetch the account's subscription entitlement (live, not cached).
+
+        A single lightweight JSON call to the OBI subscriptions endpoint
+        determines both login state and subscription tier, avoiding any
+        consumer-web-page scraping. The result is intentionally not cached:
+        the endpoint is cheap and Yahoo does not rate-limit it at any realistic
+        volume, so a fresh call each time keeps the answer from going stale
+        (e.g. if the login session expires part-way through a long-running
+        process).
+
+        Returns:
+            dict | None: The entitlement ``result`` object when logged in, or
+            ``None`` when not logged in (anonymous sessions return HTTP 401).
+        """
+        try:
+            response = self._data.get(_SUBSCRIPTIONS_URL)
+            if response.status_code == 200:
+                result = (response.json() or {}).get("result")
+                if isinstance(result, dict) and result.get("guid"):
+                    # Confirmed logged in: keep the login cookies protected.
+                    self._data._set_logged_in(True)
+                    return result
+            # A definitive non-logged-in answer (e.g. 401/403, or 200 without a
+            # guid): let the cookie-strategy toggle clear the stale jar again.
+            self._data._set_logged_in(False)
+            return None
+        except Exception as e:
+            # Transient/network error can't confirm login state either way, so
+            # leave _logged_in unchanged rather than flipping a valid login off.
+            if not YfConfig.debug.hide_exceptions:
+                raise
+            utils.get_yf_logger().error(f"Error confirming login: {e}")
+            return None
+
+    def check_login(self) -> bool:
+        """Check whether the user is logged in to Yahoo Finance.
+
+        Note: ``False`` during a transient error (e.g. Yahoo briefly
+        unreachable) means "could not confirm" rather than "logged out" — the
+        stored login cookies are kept and remain protected in that case.
+        """
+        return self._fetch_entitlement() is not None
+
+    def subscription_tier(self) -> str | None:
+        """Return the Yahoo Finance subscription tier of the logged-in account.
+
+        Read directly from the account's tier id in ``subscriptionView`` (the
+        value the account is billed against) rather than inferring it from the
+        granted feature set, which Yahoo reshuffles between tiers.
+
+        Returns:
+            str | None: ``'gold'``, ``'silver'`` or ``'bronze'`` for a named
+            subscription (``'premium'`` for a subscribed tier with no marketed
+            name), ``'free'`` when logged in without a subscription, or ``None``
+            when not logged in.
+        """
+        entitlement = self._fetch_entitlement()
+        if entitlement is None:
+            return None
+        active = [s for s in (entitlement.get("subscriptionView") or [])
+                  if s.get("action") == "ACTIVE"]
+        if not active:
+            return "free"
+        return _TIER_NAMES.get(active[0].get("tier"), "premium")
+
+    @property
+    def user(self) -> dict | None:
+        """
+        Get the logged-in user's details.
+
+        Returns:
+            dict | None: ``{'guid': ...}`` if logged in, or ``None`` if not.
+        """
+        entitlement = self._fetch_entitlement()
+        return {"guid": entitlement["guid"]} if entitlement else None
