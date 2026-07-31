@@ -1,6 +1,11 @@
 Change Log
 ===========
 
+1.5.2
+-----
+Patches
+- Fix yfinance breaking with curl_cffi>=0.16
+
 1.5.1
 -----
 Minor
