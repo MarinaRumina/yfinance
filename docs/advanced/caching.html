@@ -397,7 +397,7 @@ document.write(`
 <h1>Caching<a class="headerlink" href="#caching" title="Link to this heading">#</a></h1>
 <section id="persistent-cache">
 <h2>Persistent Cache<a class="headerlink" href="#persistent-cache" title="Link to this heading">#</a></h2>
-<p>To reduce Yahoo, yfinance store some data locally: timezones to localize dates, and cookie. Cache location is:</p>
+<p>To reduce requests to Yahoo, yfinance stores some data locally: timezones to localize dates, and cookies. Cache location is:</p>
 <ul class="simple">
 <li><p>Windows = C:/Users/&lt;USER&gt;/AppData/Local/py-yfinance</p></li>
 <li><p>Linux = /home/&lt;USER&gt;/.cache/py-yfinance</p></li>
@@ -405,7 +405,7 @@ document.write(`
 </ul>
 <p>You can direct cache to use a different location with <a class="reference internal" href="../reference/api/yfinance.set_tz_cache_location.html#yfinance.set_tz_cache_location" title="yfinance.set_tz_cache_location"><code class="xref py py-attr docutils literal notranslate"><span class="pre">set_tz_cache_location</span></code></a>:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">yfinance</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">yf</span>
-<span class="n">yf</span><span class="o">.</span><span class="n">set_tz_cache_location</span><span class="p">(</span><span class="s2">&quot;custom/cache/location&quot;</span><span class="p">)</span>
+<span class="n">yf</span><span class="o">.</span><span class="n">set_tz_cache_location</span><span class="p">(</span><span class="s2">"custom/cache/location"</span><span class="p">)</span>
 </pre></div>
 </div>
 </section>
